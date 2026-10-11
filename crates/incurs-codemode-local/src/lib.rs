@@ -98,10 +98,35 @@ pub struct LocalCodeModeService {
 impl LocalCodeModeService {
     /// Starts a dedicated current-thread runtime and constructs Code Mode on it.
     pub fn spawn(factory: impl FnOnce() -> CodeMode + Send + 'static) -> Result<Self, String> {
+        Self::spawn_on_thread(
+            std::thread::Builder::new().name("incurs-codemode-local".to_string()),
+            factory,
+        )
+    }
+
+    /// Starts an actor with an explicit native stack size in bytes.
+    ///
+    /// Allow headroom beyond the executor's QuickJS stack limit so the engine
+    /// can raise a JavaScript exception before exhausting the host thread.
+    pub fn spawn_with_stack_size(
+        stack_size: usize,
+        factory: impl FnOnce() -> CodeMode + Send + 'static,
+    ) -> Result<Self, String> {
+        Self::spawn_on_thread(
+            std::thread::Builder::new()
+                .name("incurs-codemode-local".to_string())
+                .stack_size(stack_size),
+            factory,
+        )
+    }
+
+    fn spawn_on_thread(
+        thread: std::thread::Builder,
+        factory: impl FnOnce() -> CodeMode + Send + 'static,
+    ) -> Result<Self, String> {
         let (sender, receiver) = mpsc::channel(64);
         let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
-        std::thread::Builder::new()
-            .name("incurs-codemode-local".to_string())
+        thread
             .spawn(move || {
                 let runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_time()
@@ -885,6 +910,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn circular_values_fail_without_rejecting_shared_references() {
+        let codemode = CodeMode::new(
+            Arc::new(MemoryStore::default()),
+            LocalExecutor::default(),
+            vec![Arc::new(ContextConnector)],
+        );
+        for code in [
+            "const value = {}; value.self = value; return value;",
+            "const value = []; value.push(value); return value;",
+            "const value = {}; value.self = value; return await context.inspect(value);",
+            "return await codemode.step('cycle', async () => { const value = {}; value.self = value; return value; });",
+        ] {
+            let execution = codemode.execute(code).await.unwrap();
+            assert_eq!(execution.status, ExecutionStatus::Error, "{execution:?}");
+            let error = execution.error.as_deref().expect("recorded cycle error");
+            assert!(
+                error.contains("CODE_VALUE_CYCLE"),
+                "cycle must have a specific diagnostic: {error}"
+            );
+        }
+        let execution = codemode
+            .execute("const shared = {answer: 42}; return {left: shared, right: shared};")
+            .await
+            .unwrap();
+        assert_eq!(execution.status, ExecutionStatus::Completed);
+        assert_eq!(
+            execution.result,
+            Some(json!({"left": {"answer": 42}, "right": {"answer": 42}}))
+        );
+    }
+
+    #[tokio::test]
+    async fn caught_cycles_preserve_recovery_and_unrecorded_step_outcomes() {
+        let codemode = CodeMode::new(
+            Arc::new(MemoryStore::default()),
+            LocalExecutor::default(),
+            vec![Arc::new(MathConnector::default())],
+        );
+        let execution = codemode
+            .execute(
+                "const value = {}; value.self = value; const errors = []; \
+                 try { await math.sum(value); } catch (error) { errors.push(String(error)); } \
+                 try { await codemode.step('unrecorded', async () => value); } \
+                 catch (error) { errors.push(String(error)); } \
+                 const answer = await codemode.step('valid', async () => \
+                   (await math.sum({left: 20, right: 22})).sum); \
+                 return {errors, answer};",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            execution.status,
+            ExecutionStatus::Completed,
+            "{execution:?}"
+        );
+        let result = execution.result.as_ref().unwrap();
+        assert_eq!(result["answer"], json!(42));
+        let errors = result["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 2);
+        assert!(errors.iter().all(|error| {
+            error
+                .as_str()
+                .is_some_and(|message| message.contains("CODE_VALUE_CYCLE"))
+        }));
+        assert_eq!(execution.log.len(), 3);
+        let unrecorded = &execution.log[0];
+        assert_eq!(unrecorded.seq, 1);
+        assert_eq!(unrecorded.connector, "__step");
+        assert_eq!(unrecorded.state, incurs_codemode::LogEntryState::Executing);
+        assert!(unrecorded.result.is_none());
+        let recorded = &execution.log[1];
+        assert_eq!(recorded.seq, 2);
+        assert_eq!(recorded.state, incurs_codemode::LogEntryState::Applied);
+        assert_eq!(recorded.result, Some(json!(42)));
+        let error = codemode.rollback(&execution.id).await.unwrap_err();
+        assert!(error.contains("unfinished"), "{error}");
+    }
+
+    #[tokio::test]
     async fn javascript_errors_preserve_exception_details() {
         let codemode = CodeMode::new(
             Arc::new(MemoryStore::default()),
@@ -1033,6 +1137,57 @@ mod tests {
             event,
             ExecutionEvent::Chunk { data, .. } if data == &json!({"part": 1})
         )));
+    }
+
+    #[tokio::test]
+    async fn actor_stack_headroom_preserves_service_after_javascript_overflow() {
+        let service = LocalCodeModeService::spawn_with_stack_size(8 * 1024 * 1024, || {
+            CodeMode::new(
+                Arc::new(MemoryStore::default()),
+                LocalExecutor::new(LocalExecutorOptions {
+                    stack_size: 2 * 1024 * 1024,
+                    ..LocalExecutorOptions::default()
+                }),
+                vec![],
+            )
+        })
+        .unwrap();
+        for (code, expected_status, expected_error) in [
+            (
+                "function recurse() { return recurse() + 1; } return recurse();",
+                ExecutionStatus::Error,
+                Some("Maximum call stack size exceeded"),
+            ),
+            ("return 42;", ExecutionStatus::Completed, None),
+        ] {
+            let running = service
+                .execute(code.to_string(), CodeModeRunOptions::default())
+                .await
+                .unwrap();
+            let execution = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let execution = service.execution(running.id.clone()).await.unwrap();
+                    if execution.status != ExecutionStatus::Running {
+                        break execution;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("actor must remain responsive");
+            assert_eq!(execution.status, expected_status, "{execution:?}");
+            if let Some(expected) = expected_error {
+                assert!(
+                    execution
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains(expected)),
+                    "{execution:?}"
+                );
+            } else {
+                assert_eq!(execution.result, Some(json!(42)));
+            }
+        }
     }
 
     #[tokio::test]

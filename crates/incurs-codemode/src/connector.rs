@@ -148,6 +148,20 @@ pub trait Connector: Send + Sync {
     /// Returns connector metadata and schemas.
     async fn describe(&self) -> Result<ConnectorDescription, String>;
 
+    /// Resolves contextual defaults before replay comparison and dispatch.
+    ///
+    /// The default preserves caller arguments. Implementations must return stable
+    /// values for the same execution context and call sequence.
+    async fn prepare_arguments(
+        &self,
+        _seq: u64,
+        _tool: &ConnectorTool,
+        arguments: Value,
+        _context: &ToolContext,
+    ) -> Result<Value, String> {
+        Ok(arguments)
+    }
+
     /// Executes one connector method.
     async fn execute(
         &self,

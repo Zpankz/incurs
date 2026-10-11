@@ -84,13 +84,19 @@ const __base64Decode = (value) => {{
   }}
   return new Uint8Array(bytes);
 }};
-const __encode = (value) => {{
+const __encode = (value, ancestors = new WeakSet()) => {{
   if (value === undefined) return {{ __codemode_type: "undefined" }};
   if (typeof value === "bigint") return {{ __codemode_type: "bigint", value: value.toString() }};
   if (value instanceof Uint8Array) return {{ __codemode_type: "binary", value: __base64Encode(value) }};
-  if (Array.isArray(value)) return value.map(__encode);
   if (value && typeof value === "object") {{
-    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, __encode(child)]));
+    if (ancestors.has(value)) throw new TypeError("CODE_VALUE_CYCLE: cyclic values cannot cross the Code Mode boundary");
+    ancestors.add(value);
+    try {{
+      if (Array.isArray(value)) return value.map(child => __encode(child, ancestors));
+      return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, __encode(child, ancestors)]));
+    }} finally {{
+      ancestors.delete(value);
+    }}
   }}
   return value;
 }};

@@ -50,6 +50,8 @@
 
 ## Testing Conventions
 
+- **QuickJS needs native stack headroom** - keep the actor thread stack larger than the configured VM stack so recursive user code raises an exception instead of aborting the host. Reject cycles by tracking active ancestors, then remove each ancestor after encoding so repeated sibling references remain valid. Prove service survival after recursion and cycles at returns, tool arguments, and durable steps.
+
 - **Subscription replay and live delivery form one boundary** - register and buffer live changes before replay, then reconcile the overlap by stable source identity. A deterministic append during replay must reach the subscriber exactly once.
 - **Subscriber limits bound pending data** - account for aggregate queued events and bytes, release the accounting when a reader consumes data, and clean up timers and listeners on overflow, cancellation, and error. Prove both a healthy reader beyond the event limit and a blocked reader that reaches the limit.
 - **Subscription proof uses actual resource data** - a successful subscribe response, a static HTML marker, or an event metadata display does not establish delivery. Read authoritative product state, change it through an independent writer, and verify the same rendered view updates.

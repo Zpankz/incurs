@@ -284,6 +284,9 @@ impl DispatchSession {
             .iter()
             .find(|tool| tool.name == method)
             .ok_or_else(|| format!("Tool \"{method}\" not found on {connector_name}"))?;
+        let arguments = connector
+            .prepare_arguments(seq, tool, arguments, &self.context)
+            .await?;
         match self
             .runtime
             .decide(
