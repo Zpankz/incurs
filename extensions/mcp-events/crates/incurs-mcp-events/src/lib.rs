@@ -12,6 +12,7 @@ mod callback;
 mod canonical;
 mod delivery;
 mod host;
+mod queue;
 mod receiver;
 mod router;
 mod signing;
@@ -24,6 +25,7 @@ pub use host::{
     Clock, DedupeStore, Entropy, EventProvider, SubscriptionStore, TransportFailure, WebhookClient,
     WebhookRequest, WebhookResponse,
 };
+pub use queue::{DeliveryQueue, QueuedDelivery, arguments_match, drain, fan_out};
 pub use receiver::{ReceiverOutcome, receive};
 pub use router::{
     EventsRouter, Lifetimes, RouterConfig, augment_discovery, is_events_request, subscription_id,
