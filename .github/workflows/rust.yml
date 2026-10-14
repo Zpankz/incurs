@@ -159,6 +159,9 @@ jobs:
           - workspace: openai-mcp
             os: ubuntu-latest
             wasm: true
+          - workspace: mcp-events
+            os: ubuntu-latest
+            wasm: true
           - workspace: gpui
             os: macos-latest
             wasm: false
