@@ -23,6 +23,10 @@ Delivery is one decision per attempt: `deliver` returns `Delivered`, `Retry { af
 `GaveUp`, `Ended` (410, subscription removed), `Rejected`, `TooLarge`, or `Expired`. The host
 stores the queue and schedules retries.
 
+To subscribe to another server's events, `EventsClient` sends `events/list`,
+`events/subscribe`, and `events/unsubscribe` over any POST transport and reads JSON or
+event-stream responses.
+
 The draft is not part of the MCP specification and can change. Callback failures use
 error `-32015`, as ChatGPT documents; the design sketch numbers it `-32027`.
 

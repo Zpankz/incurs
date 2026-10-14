@@ -10,6 +10,7 @@
 
 mod callback;
 mod canonical;
+mod client;
 mod delivery;
 mod host;
 mod queue;
@@ -20,6 +21,7 @@ mod time;
 mod wire;
 
 pub use callback::validate_callback_url;
+pub use client::{CLIENT_PROTOCOL_VERSION, ClientError, EventsClient, SubscribeResult};
 pub use delivery::{DeliveryOutcome, DeliveryPolicy, MAX_BODY_BYTES, deliver};
 pub use host::{
     Clock, DedupeStore, Entropy, EventProvider, SubscriptionStore, TransportFailure, WebhookClient,

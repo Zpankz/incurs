@@ -53,6 +53,10 @@ This specification covers the platform-neutral crate `incurs-mcp-events`. Storag
 - R32: The Workers webhook client shall return a redirect response's status without requesting its `Location`.
 - R33: The Workers webhook client shall report a timeout when no response arrives within its configured timeout.
 - R34: The Durable Object host shall set its alarm to the due time a drain returns and shall drain when the alarm fires.
+- R35: The events client shall send each `events/list`, `events/subscribe`, and `events/unsubscribe` call as one JSON-RPC POST with header `MCP-Protocol-Version` equal to `2026-07-28`, an `Accept` header naming `application/json` and `text/event-stream`, and the caller's `Authorization` header.
+- R36: The events client shall read the JSON-RPC response from a JSON body, and from the `data:` line of an event-stream body whose JSON-RPC `id` equals the request's.
+- R37: The events client shall return the code, message, and data of a JSON-RPC error response.
+- R38: The events client shall report a response status outside 2xx as an HTTP error carrying that status.
 
 ## Acceptance criteria
 
@@ -163,4 +167,16 @@ Then each path received one valid verification request, `/ok` received `evt_1` o
 Given the A16 setup with a webhook timeout of 2 seconds, a receiver path `/redirect` that answers 302 with `Location: /ok`, and a path `/slow` that answers after 4 seconds
 When the client subscribes `/redirect`, then `/slow`
 Then `/redirect` fails with callback reason `challenge_failed` and `/ok` receives no request from it, and `/slow` fails with callback reason `timeout`.
+
+### A18 (R35, R36): Client subscribe
+
+Given a server that answers `events/subscribe` with the JSON body `{"jsonrpc":"2.0","id":1,"result":{"id":"sub_1","refreshBefore":"2026-10-15T00:00:00Z","cursor":null,"truncated":false}}`, and another that answers with an event stream holding a notification and then that response
+When the client subscribes `cloudflare.alert.workers_observability_real_time_issue` with arguments `{"account_id":"a1"}` and authorization `Bearer t1` to each
+Then each request carried `MCP-Protocol-Version: 2026-07-28`, an `Accept` header with both media types, `Authorization: Bearer t1`, and a body whose method is `events/subscribe` with the given name, arguments, URL, and secret, and both calls return subscription `sub_1` with `refreshBefore` `2026-10-15T00:00:00Z`.
+
+### A19 (R37, R38): Client errors
+
+Given a server that answers with error `-32015` and data `{"reason":"challenge_failed"}`, and a server that answers status 401
+When the client subscribes to each
+Then the first call returns an RPC error with code `-32015` and reason `challenge_failed`, and the second returns an HTTP error with status 401.
 
