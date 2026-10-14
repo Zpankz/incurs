@@ -1,0 +1,17 @@
+{
+  "name": "incurs-mcp-events-example",
+  "main": "build/worker/shim.mjs",
+  "compatibility_date": "2026-06-11",
+  "vars": {
+    // Accept loopback callback URLs. Never enable outside local testing.
+    "ALLOW_LOCAL_TESTING": "false",
+    "WEBHOOK_TIMEOUT_MS": "10000"
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "EVENTS", "class_name": "EventsHub" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["EventsHub"] }],
+  "build": {
+    "command": "worker-build --release"
+  }
+}
