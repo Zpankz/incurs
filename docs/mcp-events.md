@@ -47,8 +47,12 @@ This specification covers the platform-neutral crate `incurs-mcp-events`. Storag
 - R26: Enqueuing an `eventId` that is already queued for a subscription shall leave one queue entry for that pair.
 - R27: Draining shall attempt, in due-time order and up to the host's batch limit, every queue entry whose due time has passed.
 - R28: Draining shall remove a queue entry after any delivery outcome other than a retry.
-- R29: After a retry outcome, draining shall increment the entry's attempt and set its due time to the drain time plus the retry delay.
+- R29: After a retry outcome, draining shall increment the entry's attempt and set its due time to the time that attempt finished plus the retry delay.
 - R30: Draining shall return the earliest due time that remains in the queue, and none when the queue is empty.
+- R31: The Durable Object store shall return the subscriptions and queue entries it stored before the Worker restarted.
+- R32: The Workers webhook client shall return a redirect response's status without requesting its `Location`.
+- R33: The Workers webhook client shall report a timeout when no response arrives within its configured timeout.
+- R34: The Durable Object host shall set its alarm to the due time a drain returns and shall drain when the alarm fires.
 
 ## Acceptance criteria
 
@@ -147,4 +151,16 @@ Then the queue holds exactly two entries, one for the `doc_1` subscription and o
 Given a queue with entries due at 10 s, 20 s, and 90 s for receivers answering 200, 503, and 200, with batch limit 10, an attempt limit of 3, and a base delay of 1 s
 When the queue drains at 30 s
 Then the 200 entry due at 10 s is removed, the 503 entry has attempt 2 and due time 31 s, the 90 s entry was not attempted, and the drain returns 31 s; a drain at 31 s attempts only the 503 entry, leaves it with attempt 3 and due time 33 s, and returns 33 s; and draining an empty queue returns none.
+
+### A16 (R31, R34): Cloudflare delivery
+
+Given the `events-worker` example under `wrangler dev` with local testing enabled, and a local receiver that checks every signature with its own HMAC-SHA256
+When a client subscribes receiver paths `/ok`, `/flaky`, and `/gone`, publishes event `evt_1`, waits 5 seconds, restarts the Worker with its state kept, and publishes `evt_2`
+Then each path received one valid verification request, `/ok` received `evt_1` once, `/flaky` received `evt_1` twice with the same `webhook-id` and different signatures at least 1 second apart, `/gone` received `evt_1` and not `evt_2`, and `/ok` received `evt_2` after the restart.
+
+### A17 (R32, R33): Redirect and timeout
+
+Given the A16 setup with a webhook timeout of 2 seconds, a receiver path `/redirect` that answers 302 with `Location: /ok`, and a path `/slow` that answers after 4 seconds
+When the client subscribes `/redirect`, then `/slow`
+Then `/redirect` fails with callback reason `challenge_failed` and `/ok` receives no request from it, and `/slow` fails with callback reason `timeout`.
 

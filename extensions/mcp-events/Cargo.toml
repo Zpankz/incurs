@@ -1,6 +1,8 @@
 [workspace]
 members = [
   "crates/incurs-mcp-events",
+  "crates/incurs-mcp-events-cloudflare",
+  "examples/events-worker",
 ]
 resolver = "2"
 

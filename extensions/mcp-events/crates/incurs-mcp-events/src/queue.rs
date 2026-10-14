@@ -95,7 +95,14 @@ pub async fn drain(
         match outcome {
             DeliveryOutcome::Retry { after_ms } => {
                 queue
-                    .reschedule(subscription_id, event_id, entry.attempt + 1, now + after_ms)
+                    .reschedule(
+                        subscription_id,
+                        event_id,
+                        entry.attempt + 1,
+                        // Count the delay from when the attempt finished, so it is
+                        // the minimum gap between attempts.
+                        clock.now_ms() + after_ms,
+                    )
                     .await?
             }
             _ => queue.complete(subscription_id, event_id).await?,

@@ -341,3 +341,60 @@ async fn a15_drain() {
         None
     );
 }
+
+/// Answers 503 and moves a shared clock forward 250 ms, as a slow receiver would.
+struct SlowBusyClient(std::rc::Rc<Cell<i64>>);
+
+#[async_trait::async_trait(?Send)]
+impl WebhookClient for SlowBusyClient {
+    async fn post(&self, _request: WebhookRequest) -> Result<WebhookResponse, TransportFailure> {
+        self.0.set(self.0.get() + 250);
+        Ok(WebhookResponse {
+            status: 503,
+            body: Vec::new(),
+        })
+    }
+}
+
+struct SharedClock(std::rc::Rc<Cell<i64>>);
+impl Clock for SharedClock {
+    fn now_ms(&self) -> i64 {
+        self.0.get()
+    }
+}
+
+#[tokio::test]
+async fn a15_retry_delay_counts_from_attempt_finish() {
+    let queue = MemoryQueue::default();
+    queue
+        .put(subscription(
+            "busy",
+            "comment.created",
+            json!({}),
+            "https://a.example/busy",
+            10 * HOUR_MS,
+        ))
+        .await
+        .unwrap();
+    queue
+        .enqueue("busy", &event("evt_a"), 20_000)
+        .await
+        .unwrap();
+    let time = std::rc::Rc::new(Cell::new(30_000));
+    let policy = DeliveryPolicy {
+        max_attempts: 3,
+        base_delay_ms: 1000,
+    };
+    let next = drain(
+        &queue,
+        &queue,
+        &SlowBusyClient(time.clone()),
+        &SharedClock(time),
+        &policy,
+        10,
+    )
+    .await
+    .unwrap();
+    // The attempt finished at 30.25 s, so the retry is due 1 s later.
+    assert_eq!(next, Some(31_250));
+}

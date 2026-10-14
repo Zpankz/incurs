@@ -193,6 +193,16 @@ jobs:
       - name: Wasm target
         if: matrix.wasm
         run: cargo check --manifest-path extensions/${{ matrix.workspace }}/Cargo.toml --workspace --target wasm32-unknown-unknown --locked
+      - name: MCP Events Node
+        if: matrix.workspace == 'mcp-events'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: MCP Events Worker proof
+        if: matrix.workspace == 'mcp-events'
+        run: |
+          cargo install worker-build --locked
+          python3 extensions/mcp-events/examples/events-worker/scripts/smoke.py
 
       - name: OpenAI browser WASM clippy
         if: matrix.workspace == 'openai-mcp'

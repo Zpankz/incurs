@@ -64,7 +64,8 @@ pub struct Event {
 }
 
 impl Event {
-    pub(crate) fn to_wire(&self) -> Value {
+    /// The webhook body object.
+    pub fn to_wire(&self) -> Value {
         json!({
             "eventId": self.event_id,
             "name": self.name,
@@ -74,7 +75,8 @@ impl Event {
         })
     }
 
-    pub(crate) fn from_wire(value: &Value) -> Option<Self> {
+    /// Parse a webhook body object; `None` when a required field is missing.
+    pub fn from_wire(value: &Value) -> Option<Self> {
         Some(Self {
             event_id: value.get("eventId")?.as_str()?.to_string(),
             name: value.get("name")?.as_str()?.to_string(),
