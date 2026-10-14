@@ -107,7 +107,11 @@ fn release_packages() -> Vec<(Workspace, String, String)> {
         (Workspace::Openai, "incurs-openai-mcp-app", "0.1.0"),
         (Workspace::Openai, "incurs-openai-mcp", "0.1.1"),
         (Workspace::McpEvents, "incurs-mcp-events", "0.1.0"),
-        (Workspace::McpEvents, "incurs-mcp-events-cloudflare", "0.1.0"),
+        (
+            Workspace::McpEvents,
+            "incurs-mcp-events-cloudflare",
+            "0.1.0",
+        ),
     ]
     .into_iter()
     .map(|(workspace, package, version)| (workspace, package.to_string(), version.to_string()))
