@@ -65,6 +65,8 @@ enum Workspace {
     Openapi,
     /// The OpenAI MCP extension workspace.
     Openai,
+    /// The MCP Events extension workspace.
+    McpEvents,
 }
 
 /// Every crate this repository publishes, with the version it publishes at.
@@ -104,6 +106,8 @@ fn release_packages() -> Vec<(Workspace, String, String)> {
         (Workspace::Openai, "incurs-openai-mcp-protocol", "0.1.0"),
         (Workspace::Openai, "incurs-openai-mcp-app", "0.1.0"),
         (Workspace::Openai, "incurs-openai-mcp", "0.1.1"),
+        (Workspace::McpEvents, "incurs-mcp-events", "0.1.0"),
+        (Workspace::McpEvents, "incurs-mcp-events-cloudflare", "0.1.0"),
     ]
     .into_iter()
     .map(|(workspace, package, version)| (workspace, package.to_string(), version.to_string()))
@@ -126,6 +130,7 @@ fn release_check() -> Result<(), Box<dyn std::error::Error>> {
     let gpui = root.join("extensions/gpui");
     let openapi = root.join("extensions/openapi");
     let openai = root.join("extensions/openai-mcp");
+    let mcp_events = root.join("extensions/mcp-events");
     let declared = release_packages();
     let packages: Vec<(&Path, &str, &str)> = declared
         .iter()
@@ -136,6 +141,7 @@ fn release_check() -> Result<(), Box<dyn std::error::Error>> {
                 Workspace::Gpui => gpui.as_path(),
                 Workspace::Openapi => openapi.as_path(),
                 Workspace::Openai => openai.as_path(),
+                Workspace::McpEvents => mcp_events.as_path(),
             };
             (package_root, package.as_str(), version.as_str())
         })
@@ -638,6 +644,7 @@ mod tests {
             root.join("extensions/gpui"),
             root.join("extensions/openapi"),
             root.join("extensions/openai-mcp"),
+            root.join("extensions/mcp-events"),
         ] {
             for member in members(&workspace) {
                 let manifest = member.join("Cargo.toml");
