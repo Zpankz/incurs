@@ -54,6 +54,10 @@ pub struct ElicitationResponse {
 
 /// Host implementation of an execution-scoped human input channel.
 #[async_trait]
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait annotates generated futures"
+)]
 pub trait ElicitationHandler: Send + Sync {
     /// Requests human input, failing when its mode or transport is unsupported.
     async fn request(&self, request: ElicitationRequest) -> Result<ElicitationResponse, String>;
