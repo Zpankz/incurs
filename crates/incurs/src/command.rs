@@ -795,6 +795,8 @@ pub trait CommandHandler: Send + Sync {
 /// Transport request metadata available to HTTP and MCP command executions.
 #[derive(Debug, Clone, Default)]
 pub struct RequestContext {
+    /// Optional execution-scoped channel for requesting human input.
+    pub elicitation: Option<crate::elicitation::Elicitation>,
     /// Request headers as lowercase names and string values.
     pub headers: HashMap<String, String>,
     /// Request method or transport operation.

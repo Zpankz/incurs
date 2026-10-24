@@ -1307,7 +1307,7 @@ mod tests {
         let skill = fs::read_to_string(root.join("skills/project/SKILL.md")).unwrap();
         assert_eq!(
             skill,
-            "---\nname: project\ndescription: \"Run project list, Run project create. Run `demo-tools project --help` for usage details.\"\nmetadata:\n  incurs.command: \"demo-tools project\"\n  incurs.requires_bin: \"demo-tools\"\n---\n\n# demo-tools project list\n\nRun project list\n\n---\n\n# demo-tools project create\n\nRun project create\n"
+            "---\nname: project\ndescription: \"Commands: list, create. Run `demo-tools project --help` for usage details.\"\nmetadata:\n  incurs.command: \"demo-tools project\"\n  incurs.requires_bin: \"demo-tools\"\n---\n\n# demo-tools project list\n\nRun project list\n\n---\n\n# demo-tools project create\n\nRun project create\n"
         );
 
         let _ = fs::remove_dir_all(&root);

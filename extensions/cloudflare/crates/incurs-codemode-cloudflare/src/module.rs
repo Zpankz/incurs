@@ -1,4 +1,9 @@
-use incurs_codemode::{ConnectorDescription, ProgramSourceOptions, build_program_source};
+use incurs_codemode::{ConnectorDescription, build_checkpoint_source};
+use sha2::{Digest, Sha256};
+
+pub(crate) const ENGINE_WASM: &[u8] = include_bytes!("dquickts/engine.wasm");
+pub(crate) const ENGINE_JS: &str = include_str!("dquickts/engine.js");
+pub(crate) const RUNNER_JS: &str = include_str!("dquickts/runner.js");
 
 /// Dynamic Worker sandbox settings.
 #[derive(Debug, Clone)]
@@ -9,6 +14,12 @@ pub struct DynamicWorkerOptions {
     pub compatibility_date: String,
     /// Additional JavaScript modules.
     pub modules: Vec<(String, String)>,
+    /// Maximum guest JavaScript heap in bytes.
+    pub memory_limit: usize,
+    /// Maximum guest stack in bytes.
+    pub stack_size: usize,
+    /// Maximum interrupt callbacks per host interval, including when Worker clocks are frozen.
+    pub interrupt_budget: u32,
 }
 
 impl Default for DynamicWorkerOptions {
@@ -17,6 +28,9 @@ impl Default for DynamicWorkerOptions {
             timeout_ms: 60_000,
             compatibility_date: "2025-06-01".to_string(),
             modules: Vec::new(),
+            memory_limit: 64 * 1024 * 1024,
+            stack_size: 512 * 1024,
+            interrupt_budget: 10_000,
         }
     }
 }
@@ -27,35 +41,56 @@ pub fn build_executor_module(
     connectors: &[ConnectorDescription],
     timeout_ms: u64,
 ) -> Result<String, String> {
-    let program = build_program_source(
+    build_checkpoint_executor_module(
         code,
         connectors,
-        &ProgramSourceOptions {
-            dispatch: r#"async (payload) => {
+        "",
+        &DynamicWorkerOptions {
+            timeout_ms,
+            ..Default::default()
+        },
+    )
+}
+
+pub(crate) fn build_checkpoint_executor_module(
+    code: &str,
+    connectors: &[ConnectorDescription],
+    execution_id: &str,
+    options: &DynamicWorkerOptions,
+) -> Result<String, String> {
+    let source = build_checkpoint_source(code, connectors, execution_id)?;
+    let mut fingerprint = Sha256::new();
+    fingerprint.update(ENGINE_WASM);
+    fingerprint.update(ENGINE_JS);
+    fingerprint.update(RUNNER_JS);
+    fingerprint.update(source.as_bytes());
+    let identity = format!("dquickts-wasm-v1/{:x}", fingerprint.finalize());
+    let settings = serde_json::json!({
+        "source":source, "identity":identity, "executionId":execution_id,
+        "memoryLimit":options.memory_limit, "stackSize":options.stack_size,
+        "timeoutMs":options.timeout_ms, "interruptBudget":options.interrupt_budget,
+    });
+    Ok(format!(
+        r#"import {{ WorkerEntrypoint }} from "cloudflare:workers";
+import createEngine from "incurs-engine.js";
+import engineWasm from "incurs-engine.wasm";
+import {{ runCheckpointProgram }} from "incurs-runner.js";
+export default class CodeExecutor extends WorkerEntrypoint {{
+  async evaluate() {{
+    const settings = {settings};
+    settings.executionId ||= this.env.__INCURS_CODEMODE_EXECUTION_ID;
+    return runCheckpointProgram(settings, createEngine, engineWasm, async payload => {{
       const response = await fetch(
         "https://incurs-codemode.internal/__incurs_codemode_dispatch",
-        {
+        {{
           method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            ...payload,
-            execution_id: this.env.__INCURS_CODEMODE_EXECUTION_ID
-          })
-        }
+          headers: {{ "content-type": "application/json" }},
+          body: JSON.stringify(payload)
+        }}
       );
       if (!response.ok) throw new Error(await response.text());
       return response.json();
-    }"#
-            .to_string(),
-            execution_id: "this.env.__INCURS_CODEMODE_EXECUTION_ID".to_string(),
-            timeout_ms: Some(timeout_ms),
-        },
-    )?;
-    Ok(format!(
-        r#"import {{ WorkerEntrypoint }} from "cloudflare:workers";
-export default class CodeExecutor extends WorkerEntrypoint {{
-  async evaluate() {{
-    {program}
+    }});
   }}
 }}
 "#
@@ -94,7 +129,7 @@ mod tests {
         assert!(source.contains("const response = await fetch("));
         // The dispatch shape moved from per-method bindings into the namespace proxy,
         // so the harness spells it with double quotes now.
-        assert!(source.contains(r#"kind: "call""#));
-        assert!(source.contains("Code execution timed out"));
+        assert!(source.contains("incurs-engine.wasm"));
+        assert!(source.contains("runCheckpointProgram"));
     }
 }

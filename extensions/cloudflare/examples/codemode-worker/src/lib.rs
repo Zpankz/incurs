@@ -20,7 +20,7 @@ use incurs_codemode_cloudflare::{
     McpHttpRequest, WorkerLoader, drive_with_terminal_failure, handle_mcp_request,
     persist_terminal_failure, tenant_key,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use worker::{
     Context, DurableObject, Env, Request, Response, Result, State, durable_object, event,
     wasm_bindgen,
@@ -41,13 +41,45 @@ impl CommandHandler for Sum {
     }
 }
 
-struct Save;
+struct Save(worker::SqlStorage);
+
+#[derive(Deserialize, Serialize)]
+struct Receipt {
+    id: i64,
+    value: String,
+}
 
 #[async_trait::async_trait]
 impl CommandHandler for Save {
     async fn run(&self, context: CommandContext) -> CommandResult {
+        let value = context.options["value"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let receipt = self
+            .0
+            .exec(
+                "INSERT INTO incurs_cm_example_receipts (value) VALUES (?) RETURNING id, value",
+                vec![value.into()],
+            )
+            .and_then(|rows| rows.to_array::<Receipt>());
+        let receipt = match receipt {
+            Ok(mut receipts) if receipts.len() == 1 => receipts.remove(0),
+            other => {
+                return CommandResult::Error {
+                    code: "SAVE_FAILED".into(),
+                    message: other
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "No receipt returned".into()),
+                    retryable: false,
+                    exit_code: None,
+                    cta: None,
+                };
+            }
+        };
         CommandResult::Ok {
-            data: serde_json::json!({ "saved": context.options["value"] }),
+            data: serde_json::json!({ "saved": receipt.value, "receipt": receipt.id }),
             cta: None,
             exit_code: None,
         }
@@ -56,6 +88,7 @@ impl CommandHandler for Save {
 
 struct MathConnector {
     inner: IncurConnector,
+    sql: worker::SqlStorage,
 }
 
 #[async_trait::async_trait]
@@ -81,10 +114,24 @@ impl Connector for MathConnector {
         &self,
         method: &str,
         _arguments: serde_json::Value,
-        _result: serde_json::Value,
+        result: serde_json::Value,
         _context: &ToolContext,
     ) -> std::result::Result<bool, String> {
-        Ok(method == "save")
+        if method != "save" {
+            return Ok(false);
+        }
+        let receipt = result["receipt"]
+            .as_i64()
+            .ok_or("Save result has no receipt")?;
+        Ok(self
+            .sql
+            .exec(
+                "DELETE FROM incurs_cm_example_receipts WHERE id = ?",
+                vec![receipt.into()],
+            )
+            .map_err(|e| e.to_string())?
+            .rows_written()
+            == 1)
     }
 }
 
@@ -223,6 +270,19 @@ impl DurableObject for CodeModeExample {
             );
         }
         let response = match path.as_str() {
+            "/receipts" => {
+                return Response::from_json(
+                    &self
+                        .state
+                        .storage()
+                        .sql()
+                        .exec(
+                            "SELECT id, value FROM incurs_cm_example_receipts ORDER BY id",
+                            None,
+                        )?
+                        .to_array::<Receipt>()?,
+                );
+            }
             "/execute" => {
                 let input = request.json::<ExecuteRequest>().await?;
                 runtime.execute(&input.code).await
@@ -288,7 +348,9 @@ impl CodeModeExample {
             .durable_object("CODEMODE")?
             .id_from_string(&self.state.id().to_string())?
             .get_stub()?;
-        let store = Arc::new(DurableSqlStore::new(self.state.storage().sql())?);
+        let sql = self.state.storage().sql();
+        sql.exec("CREATE TABLE IF NOT EXISTS incurs_cm_example_receipts (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT NOT NULL)", None)?;
+        let store = Arc::new(DurableSqlStore::new(sql.clone())?);
         let artifacts = store.clone();
         let read_only = McpCommandOptions {
             annotations: Some(McpAnnotations {
@@ -308,7 +370,7 @@ impl CodeModeExample {
             )
             .command(
                 "save",
-                CommandDef::build("save", Save)
+                CommandDef::build("save", Save(sql.clone()))
                     .description("Persist a value.")
                     .options::<SaveOptions>()
                     .done(),
@@ -320,6 +382,7 @@ impl CodeModeExample {
                 artifacts,
                 DynamicWorkerExecutor::new(loader, dispatcher, DynamicWorkerOptions::default()),
                 vec![Arc::new(MathConnector {
+                    sql,
                     inner: IncurConnector::new(catalog)
                         .with_call_options(ToolCallOptions::isolated()),
                 })],
@@ -339,6 +402,22 @@ struct WorkerCodeModeService<'a> {
 
 #[async_trait::async_trait(?Send)]
 impl incurs_codemode_cloudflare::WorkerCodeModeService for WorkerCodeModeService<'_> {
+    async fn resume(
+        &self,
+        execution_id: String,
+        options: CodeModeRunOptions,
+    ) -> std::result::Result<ExecutionState, String> {
+        let state = self.runtime.execution_snapshot(&execution_id).await?;
+        if state.status != incurs_codemode::ExecutionStatus::Running {
+            return Err("Only an interrupted running execution can resume; pending approvals require a decision".into());
+        }
+        let runtime = Rc::clone(&self.runtime);
+        self.state.wait_until(async move {
+            let _ = drive_with_terminal_failure(&runtime, &execution_id, options, &CloudflareClock)
+                .await;
+        });
+        Ok(state)
+    }
     async fn search(&self, query: String) -> std::result::Result<SearchOutput, String> {
         self.runtime.search(&query).await
     }

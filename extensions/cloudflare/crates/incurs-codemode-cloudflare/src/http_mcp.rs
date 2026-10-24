@@ -39,6 +39,14 @@ pub trait WorkerCodeModeService {
     ) -> Result<ExecutionState, String>;
     /// Reads one execution snapshot.
     async fn execution(&self, execution_id: String) -> Result<ExecutionState, String>;
+    /// Restarts an interrupted running execution using the current request context.
+    async fn resume(
+        &self,
+        _execution_id: String,
+        _options: CodeModeRunOptions,
+    ) -> Result<ExecutionState, String> {
+        Err("This host does not support resuming interrupted executions".into())
+    }
     /// Reads one execution-owned artifact.
     async fn artifact(&self, execution_id: String, artifact_id: String) -> Result<Value, String>;
     /// Approves one pending action.
@@ -130,12 +138,13 @@ pub fn mcp_tool_definitions() -> Vec<Value> {
         ),
         tool(
             "codemode_execution",
-            "Read an execution or one oversized artifact owned by it.",
+            "Read an execution or its artifact; set resume to restart an interrupted running execution.",
             json!({
                 "type": "object",
                 "properties": {
                     "id": {"type": "string"},
-                    "artifact_id": {"type": "string"}
+                    "artifact_id": {"type": "string"},
+                    "resume": {"type": "boolean"}
                 },
                 "required": ["id"],
                 "additionalProperties": false
@@ -294,6 +303,7 @@ async fn handle_rpc_request(
                     service,
                     params,
                     Some(RequestContext {
+                        elicitation: None,
                         headers: headers.into_iter().collect(),
                         method: http.method,
                         path: http.path,
@@ -395,9 +405,24 @@ async fn call_tool(
                 .and_then(to_value)
         }
         "codemode_execution" => {
-            only_keys(&arguments, &["id", "artifact_id"])?;
+            only_keys(&arguments, &["id", "artifact_id", "resume"])?;
             let execution_id = string(&arguments, "id")?.to_string();
-            if let Some(artifact_id) = arguments.get("artifact_id") {
+            let resume = match arguments.get("resume") {
+                None | Some(Value::Bool(false)) => false,
+                Some(Value::Bool(true)) => true,
+                _ => return Err(RpcFault::invalid_params("\"resume\" must be a boolean")),
+            };
+            if resume && arguments.contains_key("artifact_id") {
+                return Err(RpcFault::invalid_params(
+                    "\"resume\" cannot be combined with \"artifact_id\"",
+                ));
+            }
+            if resume {
+                service
+                    .resume(execution_id, options)
+                    .await
+                    .and_then(to_value)
+            } else if let Some(artifact_id) = arguments.get("artifact_id") {
                 service
                     .artifact(
                         execution_id,

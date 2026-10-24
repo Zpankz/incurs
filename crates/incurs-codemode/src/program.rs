@@ -1,5 +1,31 @@
 use crate::{ConnectorDescription, normalize_code};
 
+/// Builds a promise queue whose continuation belongs entirely to the JavaScript heap.
+///
+/// Executors drain jobs, save the heap, dispatch the first queued payload, and
+/// resolve its promise. The heap retains no host future or native callback.
+pub fn build_checkpoint_source(
+    code: &str,
+    connectors: &[ConnectorDescription],
+    execution_id: &str,
+) -> Result<String, String> {
+    let program = build_program_source(code, connectors, &ProgramSourceOptions {
+        dispatch: "payload => new Promise(resolve => globalThis.__incursDurable.pending.push({payload, resolve}))".into(),
+        execution_id: "globalThis.__incursDurable.executionId".into(),
+        timeout_ms: None,
+    })?;
+    let execution_id = serde_json::to_string(execution_id).map_err(|e| e.to_string())?;
+    Ok(format!(
+        r#"
+globalThis.__incursDurable = {{pending: [], output: null, failure: null, executionId: globalThis.__incursExecutionId ?? {execution_id}}};
+(async () => {{ {program} }})().then(
+  value => {{ globalThis.__incursDurable.output = JSON.stringify(value); }},
+  failure => {{ globalThis.__incursDurable.failure = String(failure); }}
+);
+"#
+    ))
+}
+
 /// Adapter-specific settings for the shared Code Mode JavaScript harness.
 #[derive(Debug, Clone)]
 pub struct ProgramSourceOptions {

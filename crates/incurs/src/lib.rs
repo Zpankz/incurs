@@ -9,6 +9,7 @@ pub mod command;
 pub mod completions;
 pub mod config;
 pub mod config_schema;
+pub mod elicitation;
 pub mod errors;
 pub mod fetch;
 pub mod filter;

@@ -1,0 +1,10 @@
+{
+  "revision": "f9a3efaa4d7cadb9dcad7e80a03d2774eb95a406",
+  "compiler": "emcc (Emscripten gcc/clang-like replacement + linker emulating GNU ld) 4.0.22-git",
+  "bridge_sha256": "1860030133604eeb9e8053da56a95a63da37c2727c7e29903729ebe66954979b",
+  "sha256": {
+    "engine.js": "20093b514f05f718a1004eb7b6abad3ab4f56b0d184c4c59df61fbffc1991bce",
+    "engine.wasm": "27ab6b75de2d854c01d8fa55a1b8bc5a073e110134e62a905fb5d305c1fe385d",
+    "engine.LICENSE": "e395e4e9d57597b5b18dbfea93ad00ba72328e0fbee785b059dc24daf8a5cf6d"
+  }
+}

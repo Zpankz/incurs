@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use incurs_codemode::{ArtifactRef, ArtifactStore, ExecutionState, RuntimeStore, Snippet};
+use incurs_codemode::{
+    ArtifactRef, ArtifactStore, ExecutionCheckpoint, ExecutionState, RuntimeStore, Snippet,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -13,6 +15,12 @@ pub struct DurableSqlStore {
 
 #[derive(Deserialize)]
 struct JsonRow {
+    json: String,
+}
+
+#[derive(Deserialize)]
+struct CheckpointRow {
+    part: usize,
     json: String,
 }
 
@@ -37,6 +45,12 @@ impl DurableSqlStore {
                 id TEXT PRIMARY KEY,
                 execution_id TEXT NOT NULL,
                 json TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS incurs_cm_checkpoint_parts (
+                execution_id TEXT NOT NULL,
+                part INTEGER NOT NULL,
+                json TEXT NOT NULL,
+                PRIMARY KEY(execution_id, part)
              );",
             None,
         )?;
@@ -116,6 +130,75 @@ impl ArtifactStore for DurableSqlStore {
 
 #[async_trait]
 impl RuntimeStore for DurableSqlStore {
+    async fn get_checkpoint(
+        &self,
+        id: &str,
+    ) -> std::result::Result<Option<ExecutionCheckpoint>, String> {
+        let rows = self
+            .sql
+            .exec(
+                "SELECT part, json FROM incurs_cm_checkpoint_parts WHERE execution_id = ? ORDER BY part",
+                vec![id.into()],
+            )
+            .map_err(|e| e.to_string())?
+            .to_array::<CheckpointRow>()
+            .map_err(|e| e.to_string())?;
+        let Some(header) = rows.first() else {
+            return Ok(None);
+        };
+        let count = header.json.parse::<usize>().map_err(|e| e.to_string())?;
+        if header.part != 0 || count > 32 || rows.len() < count + 1 {
+            return Err("Incomplete engine checkpoint".into());
+        }
+        let mut json = String::new();
+        for (index, row) in rows.into_iter().skip(1).take(count).enumerate() {
+            if row.part != index + 1 {
+                return Err("Incomplete engine checkpoint".into());
+            }
+            json.push_str(&row.json);
+        }
+        serde_json::from_str(&json)
+            .map(Some)
+            .map_err(|e| e.to_string())
+    }
+
+    async fn put_checkpoint(
+        &self,
+        id: &str,
+        checkpoint: &ExecutionCheckpoint,
+    ) -> std::result::Result<(), String> {
+        let json = serde_json::to_string(checkpoint).map_err(|e| e.to_string())?;
+        if json.len() > 32_000_000 {
+            return Err("Engine checkpoint exceeds 32 MB storage limit".into());
+        }
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        while start < json.len() {
+            let mut end = (start + 1_000_000).min(json.len());
+            while !json.is_char_boundary(end) {
+                end -= 1;
+            }
+            chunks.push(json[start..end].to_string());
+            start = end;
+        }
+        let count = chunks.len();
+        let mut values = vec![SqlStorageValue::from(id)];
+        let mut bindings = Vec::new();
+        for (part, text) in std::iter::once(count.to_string()).chain(chunks).enumerate() {
+            let position = values.len() + 1;
+            bindings.push(format!("(?1, ?{position}, ?{})", position + 1));
+            values.push((part as i64).into());
+            values.push(text.into());
+        }
+        self.sql.exec(&format!("INSERT OR REPLACE INTO incurs_cm_checkpoint_parts (execution_id, part, json) VALUES {}", bindings.join(",")), values).map_err(|e| e.to_string())?;
+        self.sql
+            .exec(
+                "DELETE FROM incurs_cm_checkpoint_parts WHERE execution_id = ? AND part > ?",
+                vec![id.into(), (count as i64).into()],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
     async fn get_execution(&self, id: &str) -> std::result::Result<Option<ExecutionState>, String> {
         let rows = self
             .sql
@@ -167,6 +250,12 @@ impl RuntimeStore for DurableSqlStore {
     }
 
     async fn delete_execution(&self, id: &str) -> std::result::Result<(), String> {
+        self.sql
+            .exec(
+                "DELETE FROM incurs_cm_checkpoint_parts WHERE execution_id = ?",
+                vec![id.into()],
+            )
+            .map_err(|e| e.to_string())?;
         self.sql
             .exec(
                 "DELETE FROM incurs_cm_executions WHERE id = ?",

@@ -1080,6 +1080,7 @@ mod tests {
                     globals: None,
                     mcp: None,
                     request: Some(RequestContext {
+                        elicitation: None,
                         path: "test-request".to_string(),
                         ..RequestContext::default()
                     }),

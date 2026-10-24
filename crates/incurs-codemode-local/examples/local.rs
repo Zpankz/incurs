@@ -5,8 +5,8 @@ use incurs::command::{
     CommandContext, CommandDef, CommandHandler, McpAnnotations, McpCommandOptions,
 };
 use incurs::output::CommandResult;
-use incurs_codemode::{CodeMode, IncurConnector, MemoryStore};
-use incurs_codemode_local::LocalExecutor;
+use incurs_codemode::IncurConnector;
+use incurs_codemode_local::open_codemode;
 use serde::Deserialize;
 
 struct Sum;
@@ -52,13 +52,15 @@ async fn main() -> Result<(), String> {
                 .done(),
         )
         .tool_catalog();
-    let codemode = CodeMode::new(
-        Arc::new(MemoryStore::default()),
-        LocalExecutor::default(),
+    let mut arguments = std::env::args().skip(1);
+    let database = arguments.next().unwrap_or_else(|| "codemode.sqlite".into());
+    let codemode = open_codemode(
+        database,
+        Default::default(),
         vec![Arc::new(IncurConnector::new(catalog))],
-    );
-    let code = std::env::args()
-        .nth(1)
+    )?;
+    let code = arguments
+        .next()
         .unwrap_or_else(|| "math.sum({ left: 2, right: 3 })".to_string());
     let execution = codemode.execute(&code).await?;
     println!(

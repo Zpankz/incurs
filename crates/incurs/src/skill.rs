@@ -253,28 +253,29 @@ fn render_group(
     groups: &BTreeMap<String, String>,
     prefix: Option<&str>,
 ) -> String {
+    // The description is the always-loaded trigger, so it carries the group's
+    // own description, the only command's description, or failing that the
+    // command names. Each command's full description lives in the body, which
+    // loads only when the skill fires.
     let group_desc = prefix.and_then(|p| groups.get(p).map(|s| s.as_str()));
-    let child_descs: Vec<&str> = cmds
-        .iter()
-        .filter_map(|c| c.description.as_deref())
-        .collect();
+    let summary = match group_desc {
+        Some(gd) => Some(gd.trim_end_matches('.').to_string()),
+        None if cmds.len() == 1 => cmds[0]
+            .description
+            .as_deref()
+            .map(|d| d.trim_end_matches('.').to_string()),
+        None => {
+            let names: Vec<&str> = cmds
+                .iter()
+                .map(|c| c.name.rsplit(' ').next().unwrap_or(&c.name))
+                .collect();
+            (!names.is_empty()).then(|| format!("Commands: {}", names.join(", ")))
+        }
+    };
 
-    let mut desc_parts: Vec<String> = Vec::new();
-    if let Some(gd) = group_desc {
-        desc_parts.push(gd.trim_end_matches('.').to_string());
-    }
-    if !child_descs.is_empty() {
-        desc_parts.push(child_descs.join(", "));
-    }
-
-    let mut description = if desc_parts.is_empty() {
-        format!("Run `{} --help` for usage details.", title)
-    } else {
-        format!(
-            "{}. Run `{} --help` for usage details.",
-            desc_parts.join(". "),
-            title
-        )
+    let mut description = match summary {
+        Some(summary) => format!("{}. Run `{} --help` for usage details.", summary, title),
+        None => format!("Run `{} --help` for usage details.", title),
     };
     if description.chars().count() > 1024 {
         let suffix = "... See command details below.";

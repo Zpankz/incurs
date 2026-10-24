@@ -19,6 +19,10 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
 use serde_json::{Map, Value, json};
 
+mod legacy;
+mod tasks;
+pub use legacy::LegacyCodeModeMcpServer;
+
 /// Stable names of the Code Mode lifecycle tools.
 pub const TOOL_NAMES: [&str; 5] = [
     "codemode_search",
@@ -68,7 +72,6 @@ pub struct CodeModeMcpServer {
     tools: Arc<Vec<Tool>>,
     standards: McpStandardSet,
     projection: ExecutionProjection,
-    /// Host shaping that takes precedence over `projection` when present.
     projector: Option<Arc<dyn ExecutionProjector>>,
     /// What this server calls itself during `initialize`.
     ///
@@ -183,14 +186,124 @@ impl CodeModeMcpServer {
     }
 }
 
+impl CodeModeMcpServer {
+    async fn call_lifecycle(
+        &self,
+        name: &str,
+        arguments: JsonObject,
+        options: CodeModeRunOptions,
+    ) -> Result<CallToolResult, ErrorData> {
+        let result = match name {
+            "codemode_search" => self
+                .service
+                .search(string(&arguments, "query")?.to_string())
+                .await
+                .and_then(to_value),
+            "codemode_execute" => self
+                .service
+                .execute(string(&arguments, "code")?.to_string(), options)
+                .await
+                .and_then(to_value),
+            "codemode_execution" => {
+                let execution_id = string(&arguments, "id")?.to_string();
+                let resume = match arguments.get("resume") {
+                    None | Some(Value::Bool(false)) => false,
+                    Some(Value::Bool(true)) => true,
+                    _ => {
+                        return Err(ErrorData::invalid_params(
+                            "\"resume\" must be a boolean",
+                            None,
+                        ));
+                    }
+                };
+                let artifact = optional_string(&arguments, "artifact_id")?;
+                if resume && artifact.is_some() {
+                    return Err(ErrorData::invalid_params(
+                        "\"resume\" cannot be combined with \"artifact_id\"",
+                        None,
+                    ));
+                }
+                if resume {
+                    self.service
+                        .resume(execution_id, options)
+                        .await
+                        .and_then(to_value)
+                } else if let Some(artifact_id) = artifact {
+                    self.service
+                        .artifact(execution_id, artifact_id.to_string())
+                        .await
+                } else {
+                    self.service
+                        .execution(execution_id)
+                        .await
+                        .and_then(to_value)
+                }
+            }
+            "codemode_decide" => {
+                let execution_id = string(&arguments, "id")?.to_string();
+                let seq = unsigned(&arguments, "seq")?;
+                match string(&arguments, "decision")? {
+                    "approve" => self
+                        .service
+                        .approve(execution_id, seq, options)
+                        .await
+                        .and_then(to_value),
+                    "reject" => self
+                        .service
+                        .reject(execution_id, seq)
+                        .await
+                        .and_then(to_value),
+                    decision => {
+                        return Err(ErrorData::invalid_params(
+                            format!("Unknown decision \"{decision}\""),
+                            None,
+                        ));
+                    }
+                }
+            }
+            "codemode_cancel" => self
+                .service
+                .cancel(string(&arguments, "id")?.to_string())
+                .await
+                .and_then(to_value),
+            _ => return Err(ErrorData::method_not_found::<CallToolRequestMethod>()),
+        };
+        // Shaping applies only to the lifecycle tools that carry execution
+        // state. A retrieved artifact is exactly what the program asked for and
+        // a search result is already bounded, so neither is trimmed.
+        let carries_execution = matches!(
+            name,
+            "codemode_execute" | "codemode_decide" | "codemode_cancel"
+        ) || (name == "codemode_execution"
+            && optional_string(&arguments, "artifact_id")?.is_none());
+
+        Ok(match result {
+            Ok(value) if carries_execution => CallToolResult::structured(match &self.projector {
+                Some(projector) => projector.project(name, &arguments, value),
+                None if self.projection == ExecutionProjection::Reduced => reduce_execution(value),
+                None => value,
+            }),
+            Ok(value) => CallToolResult::structured(value),
+            Err(error) => CallToolResult::structured_error(json!({ "error": error })),
+        })
+    }
+}
+
 impl ServerHandler for CodeModeMcpServer {
     fn get_info(&self) -> ServerInfo {
+        let mut capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_prompts()
+            .enable_resources()
+            .build();
+        if self.service.supports_retained_execution() {
+            capabilities
+                .extensions
+                .get_or_insert_with(Default::default)
+                .insert(rmcp::model::TASKS_EXTENSION_ID.into(), JsonObject::new());
+        }
         ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .enable_prompts()
-                .enable_resources()
-                .build(),
+            capabilities,
         )
         .with_server_info(self.identity.clone())
         .with_instructions(
@@ -324,9 +437,30 @@ impl ServerHandler for CodeModeMcpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        if request.name == "codemode_execute"
+            && self.service.supports_retained_execution()
+            && context.protocol_version() == Some(ProtocolVersion::V_2026_07_28)
+            && context
+                .client_capabilities()
+                .is_some_and(|caps| caps.supports_tasks())
+        {
+            let arguments = request.arguments.as_ref().cloned().unwrap_or_default();
+            let state = self
+                .service
+                .execute_retained(
+                    string(&arguments, "code")?.into(),
+                    tasks::RETENTION_MS,
+                    tasks::run_options("codemode_execute", &context),
+                )
+                .await
+                .map_err(|error| ErrorData::internal_error(error, None))?;
+            return Ok(rmcp::model::CreateTaskResult::new(tasks::metadata(&state)?).into());
+        }
         let name = request.name.as_ref();
         let arguments = request.arguments.unwrap_or_default();
-        let request = incur_request_context(name, context.extensions.get::<http::request::Parts>());
+        let mut request =
+            incur_request_context(name, context.extensions.get::<http::request::Parts>());
+        request.elicitation = Some(incurs::mcp::elicitation_for_request(&context));
         // A Code Mode execution is a durable resource, not a side effect of the
         // request that started it: `codemode_execute` returns as soon as the
         // execution is recorded and the pass keeps running behind it. Binding
@@ -335,7 +469,9 @@ impl ServerHandler for CodeModeMcpServer {
         // than a handful of calls could survive. `codemode_cancel` is how a
         // client stops an execution, and the durable state is how it observes
         // one.
-        let detached = matches!(name, "codemode_execute" | "codemode_decide");
+        let detached = matches!(name, "codemode_execute" | "codemode_decide")
+            || (name == "codemode_execution"
+                && arguments.get("resume") == Some(&Value::Bool(true)));
         let options = CodeModeRunOptions {
             cancellation: if detached {
                 tokio_util::sync::CancellationToken::new()
@@ -344,91 +480,108 @@ impl ServerHandler for CodeModeMcpServer {
             },
             request: Some(request),
         };
-        let result = match name {
-            "codemode_search" => self
-                .service
-                .search(string(&arguments, "query")?.to_string())
-                .await
-                .and_then(to_value),
-            "codemode_execute" => self
-                .service
-                .execute(string(&arguments, "code")?.to_string(), options)
-                .await
-                .and_then(to_value),
-            "codemode_execution" => {
-                let execution_id = string(&arguments, "id")?.to_string();
-                if let Some(artifact_id) = optional_string(&arguments, "artifact_id")? {
-                    self.service
-                        .artifact(execution_id, artifact_id.to_string())
-                        .await
-                } else {
-                    self.service
-                        .execution(execution_id)
-                        .await
-                        .and_then(to_value)
-                }
-            }
-            "codemode_decide" => {
-                let execution_id = string(&arguments, "id")?.to_string();
-                let seq = unsigned(&arguments, "seq")?;
-                match string(&arguments, "decision")? {
-                    "approve" => self
-                        .service
-                        .approve(execution_id, seq, options)
-                        .await
-                        .and_then(to_value),
-                    "reject" => self
-                        .service
-                        .reject(execution_id, seq)
-                        .await
-                        .and_then(to_value),
-                    decision => {
-                        return Err(ErrorData::invalid_params(
-                            format!("Unknown decision \"{decision}\""),
-                            None,
-                        ));
-                    }
-                }
-            }
-            "codemode_cancel" => self
-                .service
-                .cancel(string(&arguments, "id")?.to_string())
-                .await
-                .and_then(to_value),
-            _ => return Err(ErrorData::method_not_found::<CallToolRequestMethod>()),
-        };
-        // Shaping applies only to the lifecycle tools that carry execution
-        // state. A retrieved artifact is exactly what the program asked for and
-        // a search result is already bounded, so neither is trimmed.
-        let carries_execution = matches!(
-            name,
-            "codemode_execute" | "codemode_decide" | "codemode_cancel"
-        ) || (name == "codemode_execution"
-            && optional_string(&arguments, "artifact_id")?.is_none());
+        self.call_lifecycle(name, arguments, options)
+            .await
+            .map(Into::into)
+    }
 
-        Ok(match result {
-            Ok(value) if carries_execution => CallToolResult::structured(match &self.projector {
-                Some(projector) => projector.project(name, &arguments, value),
-                None if self.projection == ExecutionProjection::Reduced => reduce_execution(value),
-                None => value,
-            }),
-            Ok(value) => CallToolResult::structured(value),
-            Err(error) => CallToolResult::structured_error(json!({ "error": error })),
-        }
-        .into())
+    async fn get_task(
+        &self,
+        request: rmcp::model::GetTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::GetTaskResult, ErrorData> {
+        tasks::require_modern(&context)?;
+        let state = self
+            .recover_task(request.task_id, tasks::run_options("tasks/get", &context))
+            .await?;
+        tasks::detailed(self, state, &context)
+    }
+
+    async fn update_task(
+        &self,
+        request: rmcp::model::UpdateTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        tasks::require_modern(&context)?;
+        let state = self.task_state(request.task_id).await?;
+        tasks::require_form(&context)?;
+        self.answer_task(
+            state,
+            request.input_responses,
+            tasks::run_options("tasks/update", &context),
+        )
+        .await
+    }
+
+    async fn cancel_task(
+        &self,
+        request: rmcp::model::CancelTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        tasks::require_modern(&context)?;
+        self.cancel_task_execution(request.task_id)
+            .await
+            .map(|_| ())
     }
 }
 
 /// Serves the Code Mode MCP handler over process stdio until disconnected.
 pub async fn serve_stdio(service: Arc<dyn CodeModeService>) -> Result<(), String> {
-    CodeModeMcpServer::new(service)
-        .serve(rmcp::transport::io::stdio())
+    serve_stream(service, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+/// Serves newline-delimited MCP, selecting the Tasks dialect from the first request.
+/// A 2025-11-25 initialization selects the session adapter. Stateless requests
+/// and other legacy versions use [`CodeModeMcpServer`].
+pub async fn serve_stream<R, W>(
+    service: Arc<dyn CodeModeService>,
+    input: R,
+    output: W,
+) -> Result<(), String>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let mut input = tokio::io::BufReader::new(input);
+    let mut first = Vec::new();
+    (&mut input)
+        .take(4 * 1024 * 1024 + 1)
+        .read_until(b'\n', &mut first)
         .await
-        .map_err(|error| error.to_string())?
-        .waiting()
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if first.is_empty() {
+        return Ok(());
+    }
+    if first.len() > 4 * 1024 * 1024 {
+        return Err("Initial MCP request exceeds 4 MiB".into());
+    }
+    let legacy = serde_json::from_slice::<Value>(&first)
+        .ok()
+        .is_some_and(|message| {
+            message["method"] == "initialize"
+                && message["params"]["protocolVersion"] == "2025-11-25"
+        });
+    let input = std::io::Cursor::new(first).chain(input);
+    if legacy {
+        use rmcp_legacy::ServiceExt;
+        LegacyCodeModeMcpServer::new(service)
+            .serve((input, output))
+            .await
+            .map_err(|error| error.to_string())?
+            .waiting()
+            .await
+            .map_err(|error| error.to_string())?;
+    } else {
+        CodeModeMcpServer::new(service)
+            .serve((input, output))
+            .await
+            .map_err(|error| error.to_string())?
+            .waiting()
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn definitions() -> Vec<Tool> {
@@ -455,12 +608,13 @@ fn definitions() -> Vec<Tool> {
         ),
         tool(
             "codemode_execution",
-            "Read an execution or one oversized artifact owned by it.",
+            "Read an execution or its artifact; set resume to restart an interrupted running execution.",
             json!({
                 "type": "object",
                 "properties": {
                     "id": {"type": "string"},
-                    "artifact_id": {"type": "string"}
+                    "artifact_id": {"type": "string"},
+                    "resume": {"type": "boolean"}
                 },
                 "required": ["id"],
                 "additionalProperties": false
@@ -530,12 +684,14 @@ fn object(value: Value) -> JsonObject {
 fn incur_request_context(tool: &str, parts: Option<&http::request::Parts>) -> IncurRequestContext {
     let Some(parts) = parts else {
         return IncurRequestContext {
+            elicitation: None,
             headers: HashMap::new(),
             method: "tools/call".to_string(),
             path: tool.to_string(),
         };
     };
     IncurRequestContext {
+        elicitation: None,
         headers: parts
             .headers
             .iter()
@@ -1091,6 +1247,55 @@ mod tests {
         handle.abort();
     }
 
+    #[tokio::test]
+    async fn full_projection_still_returns_the_whole_execution() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = CodeModeMcpServer::new(echo_service(Arc::clone(&calls)));
+        let (client, handle) = connected(server).await;
+
+        let wire = run_to_completion(&client, REDUCING_PROGRAM).await;
+        let _ = &calls;
+
+        // The default must be byte-for-byte what callers saw before, which is
+        // what makes the reduced projection safe to add.
+        assert!(
+            wire.contains(PAYLOAD_MARKER),
+            "the default projection must still carry the full log"
+        );
+        assert!(wire.contains("capabilities"));
+
+        client.cancel().await.unwrap();
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn reduced_projection_is_dramatically_smaller() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let full_server = CodeModeMcpServer::new(echo_service(Arc::clone(&calls)));
+        let (full_client, full_handle) = connected(full_server).await;
+        let full = run_to_completion(&full_client, REDUCING_PROGRAM).await;
+        full_client.cancel().await.unwrap();
+        full_handle.abort();
+
+        let reduced_server = CodeModeMcpServer::new(echo_service(Arc::clone(&calls)))
+            .with_projection(ExecutionProjection::Reduced);
+        let (reduced_client, reduced_handle) = connected(reduced_server).await;
+        let reduced = run_to_completion(&reduced_client, REDUCING_PROGRAM).await;
+        reduced_client.cancel().await.unwrap();
+        reduced_handle.abort();
+
+        eprintln!("full={} reduced={}", full.len(), reduced.len());
+
+        // Measured rather than asserted against a remembered constant: the
+        // ratio is computed from the two payloads this run produced.
+        assert!(
+            reduced.len() * 4 < full.len(),
+            "reduction should be large, not marginal: {} vs {} bytes",
+            reduced.len(),
+            full.len()
+        );
+    }
     /// Keeps only the id, and echoes the caller's `detail` argument back.
     struct DetailProjector;
 
@@ -1183,6 +1388,7 @@ mod tests {
             events: vec![],
             created_at: 1,
             updated_at: 2,
+            retained_until: None,
         }
     }
 
@@ -1379,55 +1585,5 @@ mod tests {
                 assert_eq!(properties.get("other"), Some(&json!({"type": "boolean"})));
             }
         }
-    }
-
-    #[tokio::test]
-    async fn full_projection_still_returns_the_whole_execution() {
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let server = CodeModeMcpServer::new(echo_service(Arc::clone(&calls)));
-        let (client, handle) = connected(server).await;
-
-        let wire = run_to_completion(&client, REDUCING_PROGRAM).await;
-        let _ = &calls;
-
-        // The default must be byte-for-byte what callers saw before, which is
-        // what makes the reduced projection safe to add.
-        assert!(
-            wire.contains(PAYLOAD_MARKER),
-            "the default projection must still carry the full log"
-        );
-        assert!(wire.contains("capabilities"));
-
-        client.cancel().await.unwrap();
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn reduced_projection_is_dramatically_smaller() {
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-        let full_server = CodeModeMcpServer::new(echo_service(Arc::clone(&calls)));
-        let (full_client, full_handle) = connected(full_server).await;
-        let full = run_to_completion(&full_client, REDUCING_PROGRAM).await;
-        full_client.cancel().await.unwrap();
-        full_handle.abort();
-
-        let reduced_server = CodeModeMcpServer::new(echo_service(Arc::clone(&calls)))
-            .with_projection(ExecutionProjection::Reduced);
-        let (reduced_client, reduced_handle) = connected(reduced_server).await;
-        let reduced = run_to_completion(&reduced_client, REDUCING_PROGRAM).await;
-        reduced_client.cancel().await.unwrap();
-        reduced_handle.abort();
-
-        eprintln!("full={} reduced={}", full.len(), reduced.len());
-
-        // Measured rather than asserted against a remembered constant: the
-        // ratio is computed from the two payloads this run produced.
-        assert!(
-            reduced.len() * 4 < full.len(),
-            "reduction should be large, not marginal: {} vs {} bytes",
-            reduced.len(),
-            full.len()
-        );
     }
 }

@@ -437,6 +437,7 @@ impl McpHttpServer {
                 .to_string(),
         };
         let transport = crate::command::RequestContext {
+            elicitation: None,
             headers: request
                 .headers
                 .iter()

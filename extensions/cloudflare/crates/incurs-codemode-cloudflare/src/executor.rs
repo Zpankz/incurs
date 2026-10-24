@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use incurs_codemode::{Clock, CodeExecutor, ConnectorDescription, ExecuteResult, ExecutionHost};
-use js_sys::{Array, Object, Promise, Reflect};
+use js_sys::{Array, Object, Promise, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use worker::Stub;
 
-use crate::{DynamicWorkerOptions, build_executor_module};
+use crate::DynamicWorkerOptions;
+use crate::module::{ENGINE_JS, ENGINE_WASM, RUNNER_JS, build_checkpoint_executor_module};
 
 #[wasm_bindgen]
 extern "C" {
@@ -71,7 +72,8 @@ impl DynamicWorkerExecutor {
         connectors: &[ConnectorDescription],
         execution_id: &str,
     ) -> Result<ExecuteResult, String> {
-        let source = build_executor_module(code, connectors, self.options.timeout_ms)?;
+        let source =
+            build_checkpoint_executor_module(code, connectors, execution_id, &self.options)?;
         let settings = Object::new();
         Reflect::set(
             &settings,
@@ -88,8 +90,25 @@ impl DynamicWorkerExecutor {
         Reflect::set(&settings, &"mainModule".into(), &"executor.js".into()).map_err(js_error)?;
         let modules = Object::new();
         Reflect::set(&modules, &"executor.js".into(), &source.into()).map_err(js_error)?;
+        Reflect::set(&modules, &"incurs-engine.js".into(), &ENGINE_JS.into()).map_err(js_error)?;
+        Reflect::set(&modules, &"incurs-runner.js".into(), &RUNNER_JS.into()).map_err(js_error)?;
+        let wasm_module = Object::new();
+        Reflect::set(
+            &wasm_module,
+            &"wasm".into(),
+            &Uint8Array::from(ENGINE_WASM).buffer(),
+        )
+        .map_err(js_error)?;
+        Reflect::set(&modules, &"incurs-engine.wasm".into(), &wasm_module).map_err(js_error)?;
         for (name, source) in &self.options.modules {
-            if name != "executor.js" {
+            if ![
+                "executor.js",
+                "incurs-engine.js",
+                "incurs-runner.js",
+                "incurs-engine.wasm",
+            ]
+            .contains(&name.as_str())
+            {
                 Reflect::set(&modules, &name.clone().into(), &source.clone().into())
                     .map_err(js_error)?;
             }

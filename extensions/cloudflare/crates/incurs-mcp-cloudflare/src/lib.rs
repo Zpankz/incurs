@@ -161,6 +161,7 @@ async fn handle_rpc(
                 catalog,
                 required_params(request),
                 RequestContext {
+                    elicitation: None,
                     headers: headers.into_iter().collect(),
                     method: http.method,
                     path: http.path,

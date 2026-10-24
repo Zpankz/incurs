@@ -1,8 +1,7 @@
 //! Cloudflare WorkerLoader and Durable Object adapters for incurs Code Mode.
 //!
-//! The public API remains Rust. This crate emits a small internal JavaScript
-//! module because Dynamic Workers currently accept JavaScript or Python source,
-//! not a nested Rust/Wasm Worker.
+//! The public API remains Rust. Dynamic Workers host a pinned dquickts WebAssembly
+//! engine whose heap checkpoints live in the owning Durable Object's SQLite store.
 
 mod http_mcp;
 mod lifecycle;
