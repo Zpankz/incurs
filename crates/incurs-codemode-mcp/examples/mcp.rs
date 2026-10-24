@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), String> {
     let path = std::env::args()
         .nth(1)

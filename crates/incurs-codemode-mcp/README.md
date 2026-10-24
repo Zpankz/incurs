@@ -62,7 +62,7 @@ command elicitation is not implemented.
 Run the durable stdio example with:
 
 ```sh
-cargo run -p incurs-codemode-local --example mcp -- ./codemode.sqlite
+cargo run -p incurs-codemode-mcp --example mcp -- ./codemode.sqlite
 ```
 
 Wire behavior follows the [2025 Tasks specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks)

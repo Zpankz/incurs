@@ -169,6 +169,8 @@
 
 ## Git Conventions
 
+- **Publish dependencies stay acyclic** - place transport examples and integration tests in the transport crate. A local executor dev-depending on its MCP consumer created a registry-resolution cycle during workspace packaging, even though workspace tests passed.
+
 - **Published fixes participate in integration** - inspect the latest registry archive VCS revision and compare its source with main before releasing. The 0.13.1 skill-description fix was published from an unmerged branch; branch age alone did not identify it as required.
 
 - **Self test dependencies stay local** — when a crate enables its own testing feature through a dev-dependency with `path = "."`, omit the version. Cargo otherwise resolves the unpublished self-version from the registry during packaging. Keep versions on ordinary dependencies.

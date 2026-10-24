@@ -16,14 +16,6 @@ sqlite = ["dep:rusqlite"]
 name = "local"
 required-features = ["quickjs", "sqlite"]
 
-[[example]]
-name = "mcp"
-required-features = ["quickjs", "sqlite"]
-
-[[test]]
-name = "durability"
-required-features = ["quickjs", "sqlite"]
-
 [dependencies]
 async-trait = "0.1"
 incurs-codemode = { path = "../incurs-codemode", version = "0.12.0" }
@@ -43,7 +35,5 @@ sha2 = "0.10"
 
 [dev-dependencies]
 incurs = { path = "../incurs", version = "0.14.0" }
-incurs-codemode-mcp = { path = "../incurs-codemode-mcp", version = "0.12.0" }
-rmcp = { version = "=3.0.0-beta.5", features = ["client", "server"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

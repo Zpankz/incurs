@@ -26,3 +26,4 @@ async-trait = "0.1"
 incurs-codemode-local = { path = "../incurs-codemode-local", version = "0.12.0" }
 rmcp = { version = "=3.0.0-beta.5", features = ["client"] }
 tokio = { version = "1", features = ["io-util", "macros", "rt", "sync", "time"] }
+tempfile = "3"
