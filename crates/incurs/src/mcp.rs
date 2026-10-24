@@ -15,10 +15,14 @@ use crate::schema::FieldMeta;
 use futures::stream::BoxStream;
 use serde_json::Value;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod elicitation;
 #[cfg(all(test, feature = "http", not(target_arch = "wasm32")))]
 mod parity_tests;
 mod portable_server;
 mod shared;
+#[cfg(not(target_arch = "wasm32"))]
+pub use elicitation::elicitation_for_request;
 
 pub use portable_server::{
     DEFAULT_MAX_REQUEST_BODY_BYTES, McpHttpBody, McpHttpConfig, McpHttpRequest, McpHttpResponse,
@@ -1701,6 +1705,8 @@ mod server {
     }
 
     #[cfg(test)]
+    mod elicitation_tests;
+    #[cfg(test)]
     mod error_tests;
 
     #[cfg(test)]
@@ -2022,6 +2028,7 @@ mod server {
                     .extensions
                     .get::<axum::http::request::Parts>()
                     .map(|parts| crate::command::RequestContext {
+                        elicitation: None,
                         headers: parts
                             .headers
                             .iter()
@@ -2036,7 +2043,19 @@ mod server {
                         path: parts.uri.path().to_string(),
                     });
             #[cfg(not(feature = "http"))]
-            let transport_request = None;
+            let transport_request: Option<crate::command::RequestContext> = None;
+            let channel = super::elicitation_for_request(&context);
+            let transport_request = if transport_request.is_some()
+                || context
+                    .client_capabilities()
+                    .is_some_and(|caps| caps.elicitation.is_some())
+            {
+                let mut request = transport_request.unwrap_or_default();
+                request.elicitation = Some(channel);
+                Some(request)
+            } else {
+                None
+            };
             let request_meta = context_meta_value(&context).or_else(|| {
                 request
                     .meta

@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{ConnectorDescription, DispatchResponse, DispatchSession, StepResponse};
+use crate::{
+    ConnectorDescription, DispatchResponse, DispatchSession, ExecutionCheckpoint, StepResponse,
+};
 
 /// Result returned by a Code Mode program executor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +23,18 @@ pub struct ExecuteResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DispatchRequest {
+    /// Load the active execution's engine continuation.
+    LoadCheckpoint {
+        /// Durable execution identifier.
+        execution_id: String,
+    },
+    /// Commit the active execution's engine continuation before dispatch.
+    SaveCheckpoint {
+        /// Durable execution identifier.
+        execution_id: String,
+        /// Engine-owned continuation.
+        checkpoint: ExecutionCheckpoint,
+    },
     /// Execute or replay one connector call.
     Call {
         /// Durable execution identifier.
@@ -100,6 +114,15 @@ pub struct ExecutionHost {
 }
 
 impl ExecutionHost {
+    /// Loads this active pass's engine continuation.
+    pub async fn checkpoint(&self) -> Result<Option<ExecutionCheckpoint>, String> {
+        self.session.checkpoint().await
+    }
+
+    /// Commits this active pass's engine continuation before an external call.
+    pub async fn save_checkpoint(&self, checkpoint: &ExecutionCheckpoint) -> Result<(), String> {
+        self.session.save_checkpoint(checkpoint).await
+    }
     pub(crate) fn new(session: Arc<DispatchSession>, clock: Arc<dyn Clock>) -> Self {
         Self { session, clock }
     }

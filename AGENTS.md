@@ -50,6 +50,10 @@
 
 ## Testing Conventions
 
+- **Root scratch ignores stay anchored** - use `/tasks/` for a root scratch directory so nested Tasks test modules remain tracked and packaged. Verify new helper modules against Git ignore rules before preserving a release snapshot.
+
+- **Engine exceptions retain source locations** - copy the JavaScript exception stack before freeing it. A replacement engine can use different recursion wording; keep the service-survival assertion and a literal source-location control in the diagnostics regression.
+
 - **QuickJS needs native stack headroom** - keep the actor thread stack larger than the configured VM stack so recursive user code raises an exception instead of aborting the host. Reject cycles by tracking active ancestors, then remove each ancestor after encoding so repeated sibling references remain valid. Prove service survival after recursion and cycles at returns, tool arguments, and durable steps.
 
 - **Subscription replay and live delivery form one boundary** - register and buffer live changes before replay, then reconcile the overlap by stable source identity. A deterministic append during replay must reach the subscriber exactly once.
@@ -164,6 +168,10 @@
 - **Extension CI resolves locked dependencies** — run extension tests, Clippy, and target checks with --locked. An unlocked GPUI source build silently refreshed a stale dependency graph while its release archive refused the tracked lockfile. Verify fresh package archives after their new core dependencies are published.
 
 ## Git Conventions
+
+- **Publish dependencies stay acyclic** - place transport examples and integration tests in the transport crate. A local executor dev-depending on its MCP consumer created a registry-resolution cycle during workspace packaging, even though workspace tests passed.
+
+- **Published fixes participate in integration** - inspect the latest registry archive VCS revision and compare its source with main before releasing. The 0.13.1 skill-description fix was published from an unmerged branch; branch age alone did not identify it as required.
 
 - **Self test dependencies stay local** — when a crate enables its own testing feature through a dev-dependency with `path = "."`, omit the version. Cargo otherwise resolves the unpublished self-version from the registry during packaging. Keep versions on ordinary dependencies.
 

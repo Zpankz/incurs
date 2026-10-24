@@ -84,6 +84,19 @@ jobs:
       - run: extensions/cloudflare/examples/feature-worker/smoke.sh
       - name: Subscriptions Worker proof
         run: npm exec --yes --package=wrangler@4 -- node extensions/cloudflare/examples/subscriptions-worker/test-local.mjs
+      - name: Checkpoint engine provenance
+        run: python3 extensions/cloudflare/build_dquickts.py --check
+      - name: Code Mode heap durability
+        working-directory: extensions/cloudflare/examples/codemode-worker
+        run: |
+          worker-build --release
+          npm exec --yes --package=wrangler@4 -- python3 verify_durability.py --evidence-dir "${{ runner.temp }}/incurs-codemode-durability"
+      - name: Retain Code Mode restart captures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: incurs-codemode-durability
+          path: ${{ runner.temp }}/incurs-codemode-durability
 
   plugin-installers:
     name: Plugin installers (${{ matrix.os }})

@@ -46,6 +46,22 @@ pub struct DispatchSession {
 }
 
 impl DispatchSession {
+    pub(crate) async fn checkpoint(&self) -> Result<Option<crate::ExecutionCheckpoint>, String> {
+        self.runtime
+            .checkpoint(&self.execution_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) async fn save_checkpoint(
+        &self,
+        checkpoint: &crate::ExecutionCheckpoint,
+    ) -> Result<(), String> {
+        self.runtime
+            .save_checkpoint(&self.execution_id, checkpoint)
+            .await
+            .map_err(|e| e.to_string())
+    }
     /// Resolves connector descriptions and creates a fresh replay cursor.
     pub async fn new(
         runtime: Arc<CodeModeRuntime>,

@@ -379,7 +379,6 @@ dependencies = [
  "rand_core",
 ]
 
-
 [[package]]
 name = "http"
 version = "1.5.0"
@@ -598,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "incurs"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -653,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "incurs-openai-mcp"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "incurs",
@@ -965,6 +964,7 @@ dependencies = [
  "tokio-util",
  "tower-service",
  "tracing",
+ "url",
  "uuid",
 ]
 

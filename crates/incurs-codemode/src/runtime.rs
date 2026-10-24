@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use crate::ConnectorDescription;
+use crate::{ConnectorDescription, ExecutionCheckpoint};
 
 /// Default number of terminal executions retained by a runtime.
 pub const DEFAULT_MAX_EXECUTIONS: usize = 50;
@@ -255,6 +255,9 @@ pub struct ExecutionState {
     pub created_at: u64,
     /// Last state transition in Unix milliseconds.
     pub updated_at: u64,
+    /// Unix millisecond deadline before which history pruning retains this execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_until: Option<u64>,
 }
 
 /// A pending connector action shown to an approval UI.
@@ -307,6 +310,18 @@ pub struct Snippet {
     reason = "async_trait annotates generated futures"
 )]
 pub trait RuntimeStore: Send + Sync {
+    /// Loads an engine continuation. Stores without checkpoint support fail explicitly.
+    async fn get_checkpoint(&self, _id: &str) -> Result<Option<ExecutionCheckpoint>, String> {
+        Err("Runtime store does not support engine checkpoints".into())
+    }
+    /// Atomically replaces an engine continuation for one execution.
+    async fn put_checkpoint(
+        &self,
+        _id: &str,
+        _checkpoint: &ExecutionCheckpoint,
+    ) -> Result<(), String> {
+        Err("Runtime store does not support engine checkpoints".into())
+    }
     /// Loads one execution.
     async fn get_execution(&self, id: &str) -> Result<Option<ExecutionState>, String>;
     /// Replaces one execution.
@@ -327,6 +342,7 @@ pub trait RuntimeStore: Send + Sync {
 
 #[derive(Default)]
 struct MemoryState {
+    checkpoints: BTreeMap<String, ExecutionCheckpoint>,
     executions: BTreeMap<String, ExecutionState>,
     snippets: BTreeMap<String, Snippet>,
 }
@@ -339,6 +355,21 @@ pub struct MemoryStore {
 
 #[async_trait]
 impl RuntimeStore for MemoryStore {
+    async fn get_checkpoint(&self, id: &str) -> Result<Option<ExecutionCheckpoint>, String> {
+        Ok(self.state.lock().await.checkpoints.get(id).cloned())
+    }
+    async fn put_checkpoint(
+        &self,
+        id: &str,
+        checkpoint: &ExecutionCheckpoint,
+    ) -> Result<(), String> {
+        self.state
+            .lock()
+            .await
+            .checkpoints
+            .insert(id.into(), checkpoint.clone());
+        Ok(())
+    }
     async fn get_execution(&self, id: &str) -> Result<Option<ExecutionState>, String> {
         Ok(self.state.lock().await.executions.get(id).cloned())
     }
@@ -364,7 +395,9 @@ impl RuntimeStore for MemoryStore {
     }
 
     async fn delete_execution(&self, id: &str) -> Result<(), String> {
-        self.state.lock().await.executions.remove(id);
+        let mut state = self.state.lock().await;
+        state.executions.remove(id);
+        state.checkpoints.remove(id);
         Ok(())
     }
 
@@ -415,6 +448,41 @@ pub struct CodeModeRuntime {
 }
 
 impl CodeModeRuntime {
+    /// Loads an existing execution's engine continuation without exposing it to projections.
+    pub async fn checkpoint(&self, id: &str) -> Result<Option<ExecutionCheckpoint>, RuntimeError> {
+        let state = self.require(id).await?;
+        let checkpoint = self
+            .store
+            .get_checkpoint(id)
+            .await
+            .map_err(RuntimeError::Store)?;
+        if checkpoint.is_none() && !state.log.is_empty() {
+            return Err(RuntimeError::Store(
+                "CHECKPOINT_MISSING: execution has journaled calls but no engine continuation"
+                    .into(),
+            ));
+        }
+        Ok(checkpoint)
+    }
+
+    /// Commits an engine continuation while its execution remains running.
+    pub async fn save_checkpoint(
+        &self,
+        id: &str,
+        checkpoint: &ExecutionCheckpoint,
+    ) -> Result<(), RuntimeError> {
+        let _guard = self.gate.lock().await;
+        let state = self.require(id).await?;
+        if state.status != ExecutionStatus::Running {
+            return Err(RuntimeError::InvalidState(
+                "Only a running execution can save a checkpoint".into(),
+            ));
+        }
+        self.store
+            .put_checkpoint(id, checkpoint)
+            .await
+            .map_err(RuntimeError::Store)
+    }
     /// Creates a runtime over a persistence implementation.
     pub fn new(store: Arc<dyn RuntimeStore>) -> Self {
         Self::with_artifacts(store, Arc::new(MemoryArtifactStore::default()))
@@ -436,7 +504,8 @@ impl CodeModeRuntime {
         connectors: Vec<String>,
         now: u64,
     ) -> Result<String, RuntimeError> {
-        self.begin_inner(code.into(), connectors, None, now).await
+        self.begin_inner(code.into(), connectors, None, now, None, None)
+            .await
     }
 
     /// Creates a durable execution with an immutable capability snapshot.
@@ -446,13 +515,33 @@ impl CodeModeRuntime {
         capabilities: CapabilitySnapshot,
         now: u64,
     ) -> Result<String, RuntimeError> {
+        self.begin_retained(code, capabilities, now, None, None)
+            .await
+    }
+
+    /// Creates an execution protected from history pruning until its deadline.
+    pub async fn begin_retained(
+        &self,
+        code: &str,
+        capabilities: CapabilitySnapshot,
+        now: u64,
+        retained_until: Option<u64>,
+        execution_id: Option<String>,
+    ) -> Result<String, RuntimeError> {
         let connectors = capabilities
             .connectors
             .iter()
             .map(|connector| connector.name.clone())
             .collect();
-        self.begin_inner(code.to_string(), connectors, Some(capabilities), now)
-            .await
+        self.begin_inner(
+            code.to_string(),
+            connectors,
+            Some(capabilities),
+            now,
+            retained_until,
+            execution_id,
+        )
+        .await
     }
 
     async fn begin_inner(
@@ -461,11 +550,24 @@ impl CodeModeRuntime {
         connectors: Vec<String>,
         capabilities: Option<CapabilitySnapshot>,
         now: u64,
+        retained_until: Option<u64>,
+        execution_id: Option<String>,
     ) -> Result<String, RuntimeError> {
         let _guard = self.gate.lock().await;
         ensure_size("The execution code", &Value::String(code.clone()))?;
         let sequence = EXECUTION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let id = format!("exec_{now:016}_{sequence:016x}");
+        let id = execution_id.unwrap_or_else(|| format!("exec_{now:016}_{sequence:016x}"));
+        if self
+            .store
+            .get_execution(&id)
+            .await
+            .map_err(RuntimeError::Store)?
+            .is_some()
+        {
+            return Err(RuntimeError::InvalidState(
+                "Execution ID already exists".into(),
+            ));
+        }
         self.store
             .put_execution(&ExecutionState {
                 id: id.clone(),
@@ -483,10 +585,12 @@ impl CodeModeRuntime {
                 }],
                 created_at: now,
                 updated_at: now,
+                retained_until,
             })
             .await
             .map_err(RuntimeError::Store)?;
-        self.prune_locked(DEFAULT_MAX_EXECUTIONS, Some(&id)).await?;
+        self.prune_locked(DEFAULT_MAX_EXECUTIONS, Some(&id), Some(now))
+            .await?;
         Ok(id)
     }
 
@@ -1064,7 +1168,13 @@ impl CodeModeRuntime {
     /// Prunes terminal history while retaining every live execution.
     pub async fn prune(&self, keep: usize) -> Result<usize, RuntimeError> {
         let _guard = self.gate.lock().await;
-        self.prune_locked(keep, None).await
+        self.prune_locked(keep, None, None).await
+    }
+
+    /// Prunes terminal history, including retained executions whose deadline elapsed.
+    pub async fn prune_at(&self, keep: usize, now: u64) -> Result<usize, RuntimeError> {
+        let _guard = self.gate.lock().await;
+        self.prune_locked(keep, None, Some(now)).await
     }
 
     /// Saves a working execution as a reusable snippet.
@@ -1135,6 +1245,7 @@ impl CodeModeRuntime {
         &self,
         keep: usize,
         excluding: Option<&str>,
+        now: Option<u64>,
     ) -> Result<usize, RuntimeError> {
         let mut terminal = self
             .store
@@ -1144,6 +1255,9 @@ impl CodeModeRuntime {
             .into_iter()
             .filter(|execution| {
                 execution.status.terminal()
+                    && execution
+                        .retained_until
+                        .is_none_or(|until| now.is_some_and(|now| now >= until))
                     && excluding.is_none_or(|id| execution.id.as_str() != id)
             })
             .collect::<Vec<_>>();
@@ -1278,6 +1392,49 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[tokio::test]
+    async fn checkpoints_are_private_persisted_and_state_guarded() {
+        let store = Arc::new(MemoryStore::default());
+        let runtime = CodeModeRuntime::new(store.clone());
+        let id = runtime.begin("async () => 1", vec![], 1).await.unwrap();
+        let checkpoint = ExecutionCheckpoint {
+            identity: "fixture-build/program-1".into(),
+            bytes: vec![0, 1, 255],
+        };
+        assert!(runtime.checkpoint(&id).await.unwrap().is_none());
+        runtime.save_checkpoint(&id, &checkpoint).await.unwrap();
+        let reopened = CodeModeRuntime::new(store.clone());
+        assert_eq!(
+            reopened.checkpoint(&id).await.unwrap(),
+            Some(checkpoint.clone())
+        );
+        let projection = serde_json::to_value(reopened.execution(&id).await.unwrap()).unwrap();
+        assert!(projection.get("checkpoint").is_none());
+        runtime.cancel(&id, 2).await.unwrap();
+        assert!(runtime.save_checkpoint(&id, &checkpoint).await.is_err());
+        store.delete_execution(&id).await.unwrap();
+        assert!(store.get_checkpoint(&id).await.unwrap().is_none());
+        assert!(runtime.checkpoint(&id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn missing_checkpoint_cannot_replay_an_execution_with_journaled_calls() {
+        let runtime = runtime();
+        let id = runtime.begin("async () => 1", vec![], 1).await.unwrap();
+        runtime
+            .decide(&id, 0, "fixture", "read", json!({}), false, false, 2)
+            .await
+            .unwrap();
+        assert!(
+            runtime
+                .checkpoint(&id)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("CHECKPOINT_MISSING")
+        );
+    }
 
     fn runtime() -> CodeModeRuntime {
         CodeModeRuntime::new(Arc::new(MemoryStore::default()))

@@ -227,10 +227,27 @@ impl CodeMode {
 
     /// Creates a durable running execution without driving its first pass.
     pub async fn start(&self, code: &str) -> Result<ExecutionState, String> {
+        self.start_retained(code, None, None).await
+    }
+
+    /// Creates a running execution with an optional history retention duration.
+    pub async fn start_retained(
+        &self,
+        code: &str,
+        retention_ms: Option<u64>,
+        execution_id: Option<String>,
+    ) -> Result<ExecutionState, String> {
         let capabilities = CapabilitySnapshot::new(self.namespace_stubs())?;
+        let now = self.clock.now_ms();
         let id = self
             .runtime
-            .begin_with_capabilities(code, capabilities, self.clock.now_ms())
+            .begin_retained(
+                code,
+                capabilities,
+                now,
+                retention_ms.map(|duration| now.saturating_add(duration)),
+                execution_id,
+            )
             .await
             .map_err(|error| error.to_string())?;
         self.require(&id).await
@@ -283,15 +300,19 @@ impl CodeMode {
         seq: u64,
         options: CodeModeRunOptions,
     ) -> Result<ExecutionState, String> {
-        if !self
-            .runtime
-            .approve(execution_id, seq, self.clock.now_ms())
-            .await
-            .map_err(|error| error.to_string())?
-        {
+        if !self.approve_pending(execution_id, seq).await? {
             return self.require(execution_id).await;
         }
         self.drive_with(execution_id, options).await
+    }
+
+    /// Commits a pending approval, returning whether this caller owns its next pass.
+    /// The winner must drive the execution using its current transport authority.
+    pub async fn approve_pending(&self, execution_id: &str, seq: u64) -> Result<bool, String> {
+        self.runtime
+            .approve(execution_id, seq, self.clock.now_ms())
+            .await
+            .map_err(|error| error.to_string())
     }
 
     /// Rejects a pending action and notifies connector lifecycle hooks.
@@ -389,6 +410,27 @@ impl CodeMode {
     /// Handles one program-to-host dispatch request.
     pub async fn dispatch(&self, request: DispatchRequest) -> Result<Value, String> {
         match request {
+            DispatchRequest::LoadCheckpoint { execution_id } => {
+                let _ = self.active_context(&execution_id).await?;
+                serde_json::to_value(
+                    self.runtime
+                        .checkpoint(&execution_id)
+                        .await
+                        .map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())
+            }
+            DispatchRequest::SaveCheckpoint {
+                execution_id,
+                checkpoint,
+            } => {
+                let _ = self.active_context(&execution_id).await?;
+                self.runtime
+                    .save_checkpoint(&execution_id, &checkpoint)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({"ok": true}))
+            }
             DispatchRequest::Call {
                 execution_id,
                 seq,
@@ -439,18 +481,38 @@ impl CodeMode {
         execution_id: &str,
         options: CodeModeRunOptions,
     ) -> Result<ExecutionState, String> {
-        let gate = {
-            let mut gates = self.pass_gates.lock().await;
-            Arc::clone(
-                gates
-                    .entry(execution_id.to_string())
-                    .or_insert_with(|| Arc::new(Semaphore::new(1))),
-            )
-        };
+        let gate = self.pass_gate(execution_id).await;
         let _permit = gate
             .acquire_owned()
             .await
             .map_err(|_| "Code Mode execution gate closed".to_string())?;
+        self.drive_pass(execution_id, options).await
+    }
+
+    async fn pass_gate(&self, execution_id: &str) -> Arc<Semaphore> {
+        Arc::clone(
+            self.pass_gates
+                .lock()
+                .await
+                .entry(execution_id.to_string())
+                .or_insert_with(|| Arc::new(Semaphore::new(1))),
+        )
+    }
+
+    /// Drives an interrupted running execution without queueing behind an active pass.
+    /// Paused approvals and terminal executions remain unchanged.
+    pub async fn drive_if_idle(
+        &self,
+        execution_id: &str,
+        options: CodeModeRunOptions,
+    ) -> Result<ExecutionState, String> {
+        let Ok(_permit) = self.pass_gate(execution_id).await.try_acquire_owned() else {
+            return self.require(execution_id).await;
+        };
+        let state = self.require(execution_id).await?;
+        if state.status != ExecutionStatus::Running {
+            return Ok(state);
+        }
         self.drive_pass(execution_id, options).await
     }
 
@@ -755,6 +817,26 @@ mod tests {
             .unwrap_err();
 
         assert!(error.contains("active pass"));
+        for request in [
+            DispatchRequest::LoadCheckpoint {
+                execution_id: state.id.clone(),
+            },
+            DispatchRequest::SaveCheckpoint {
+                execution_id: state.id.clone(),
+                checkpoint: crate::ExecutionCheckpoint {
+                    identity: "fixture".into(),
+                    bytes: vec![1, 2],
+                },
+            },
+        ] {
+            assert!(
+                code_mode
+                    .dispatch(request)
+                    .await
+                    .unwrap_err()
+                    .contains("active pass")
+            );
+        }
         assert_eq!(connector.calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             code_mode.execution(&state.id).await.unwrap().status,

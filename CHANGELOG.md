@@ -1,5 +1,18 @@
 # incurs
 
+## 0.14.0
+
+Code Mode can resume its JavaScript heap after a host restart. Native MCP clients can use Tasks and elicitation for long-running executions and protected actions.
+
+- The local executor persists execution journals, artifacts, and engine checkpoints in SQLite. A restarted actor resumes the saved continuation.
+- The Cloudflare executor saves heap checkpoints in Durable Object SQLite, including checkpoints larger than one storage row.
+- The native Code Mode MCP server supports session-based 2025-11-25 Tasks and the 2026-07-28 Tasks extension. Retained tasks survive restarts; task polling resumes interrupted executions.
+- Native command handlers receive an elicitation channel for client input. Protected task actions require accepted approval input; decline, cancellation, and duplicate responses cause no additional protected side effect.
+- The published 0.13.1 fix for short group skill descriptions is retained.
+- Custom MCP execution projectors remain supported. JavaScript exceptions retain source locations, and recursion errors leave the actor responsive.
+
+Core, CLI, and extras move to 0.14.0; the Code Mode family to 0.12.0; remote, MCP client, registry, and Cloudflare MCP to 0.10.0; app adapters to 0.9.0; OpenAPI and OpenAI MCP server to 0.2.0. Cloudflare Tasks and Claude UI compatibility are not included in this release.
+
 ## 0.13.0
 
 Incurs subscriptions now have a durable release boundary for core delivery and Cloudflare delivery.

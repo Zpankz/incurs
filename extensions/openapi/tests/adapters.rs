@@ -284,6 +284,7 @@ fn state(id: &str, code: String, status: ExecutionStatus) -> ExecutionState {
         events: Vec::new(),
         created_at: 1,
         updated_at: 2,
+        retained_until: None,
     }
 }
 

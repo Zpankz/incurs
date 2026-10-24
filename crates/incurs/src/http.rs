@@ -652,6 +652,7 @@ async fn execute_http_command(
             parse_mode: ParseMode::Split,
             path: path.clone(),
             request: Some(crate::command::RequestContext {
+                elicitation: None,
                 headers: request_headers,
                 method: method.to_string(),
                 path: format!(

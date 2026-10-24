@@ -1,55 +1,82 @@
-//! Native QuickJS execution adapter for incurs Code Mode.
+//! Native actor service and optional QuickJS execution adapter for Code Mode.
 
+#[cfg(all(feature = "quickjs", feature = "sqlite"))]
+use std::path::Path;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+#[cfg(all(feature = "quickjs", feature = "sqlite"))]
+use std::sync::Arc;
 
 use incurs_codemode::{
-    CodeExecutor, CodeMode, CodeModeRunOptions, CodeModeService, ConnectorDescription,
-    ExecuteResult, ExecutionHost, ExecutionState, ProgramSourceOptions, SearchOutput,
-    build_program_source,
+    CodeMode, CodeModeRunOptions, CodeModeService, ExecutionState, SearchOutput,
 };
-use rquickjs::function::Async;
-use rquickjs::{AsyncContext, AsyncRuntime, Function, Promise};
-use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
-const CODE_EXECUTION_TIMEOUT: &str =
-    "CODE_EXECUTION_TIMEOUT: maximum uninterrupted JavaScript execution interval exceeded";
+#[cfg(feature = "quickjs")]
+mod native;
+#[cfg(feature = "quickjs")]
+mod quickjs;
+#[cfg(feature = "quickjs")]
+pub use quickjs::{LocalExecutor, LocalExecutorOptions};
 
-/// Resource limits for one local QuickJS execution pass.
-#[derive(Debug, Clone)]
-pub struct LocalExecutorOptions {
-    /// Maximum wall-clock time spent evaluating JavaScript.
-    pub timeout: Duration,
-    /// Maximum QuickJS heap size in bytes.
-    pub memory_limit: usize,
-    /// Maximum QuickJS stack size in bytes.
-    pub stack_size: usize,
-}
+#[cfg(feature = "sqlite")]
+mod store;
+#[cfg(feature = "sqlite")]
+pub use store::DurableStore;
 
-impl Default for LocalExecutorOptions {
-    fn default() -> Self {
-        Self {
-            timeout: Duration::from_secs(60),
-            memory_limit: 64 * 1024 * 1024,
-            stack_size: 512 * 1024,
-        }
-    }
-}
-
-/// Executes Code Mode programs locally in an isolated QuickJS runtime.
-#[derive(Debug, Clone, Default)]
-pub struct LocalExecutor {
+/// Opens Code Mode with its journal, artifacts, and heap in one SQLite database.
+#[cfg(all(feature = "quickjs", feature = "sqlite"))]
+pub fn open_codemode(
+    path: impl AsRef<Path>,
     options: LocalExecutorOptions,
+    connectors: Vec<Arc<dyn incurs_codemode::Connector>>,
+) -> Result<CodeMode, String> {
+    let store = Arc::new(DurableStore::open(path)?);
+    Ok(CodeMode::with_artifact_store(
+        store.clone(),
+        store,
+        LocalExecutor::new(options),
+        connectors,
+    ))
 }
 
-impl LocalExecutor {
-    /// Creates a local executor with explicit resource limits.
-    pub fn new(options: LocalExecutorOptions) -> Self {
-        Self { options }
+/// Opens a durable actor service for a CLI or MCP host.
+///
+/// The host owns the database until its service thread exits. Restarting with
+/// the same path preserves approvals, artifacts, and engine continuations.
+#[cfg(all(feature = "quickjs", feature = "sqlite"))]
+pub fn spawn_codemode(
+    path: impl AsRef<Path>,
+    options: LocalExecutorOptions,
+    connectors: Vec<Arc<dyn incurs_codemode::Connector>>,
+) -> Result<LocalCodeModeService, String> {
+    let store = Arc::new(DurableStore::open(path)?);
+    LocalCodeModeService::spawn(move || {
+        CodeMode::with_artifact_store(
+            store.clone(),
+            store,
+            LocalExecutor::new(options),
+            connectors,
+        )
+    })
+}
+
+fn random_execution_id() -> Result<String, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut bytes = [0_u8; 24];
+        getrandom::fill(&mut bytes).map_err(|error| error.to_string())?;
+        Ok(format!(
+            "exec_{}",
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Err("SECURE_EXECUTION_ID_UNAVAILABLE: host must supply secure randomness".into())
     }
 }
 
@@ -60,11 +87,18 @@ enum ServiceRequest {
     },
     Execute {
         code: String,
+        retention_ms: Option<u64>,
         options: CodeModeRunOptions,
         response: oneshot::Sender<Result<ExecutionState, String>>,
     },
     Execution {
         execution_id: String,
+        response: oneshot::Sender<Result<ExecutionState, String>>,
+    },
+    Resume {
+        execution_id: String,
+        recover: bool,
+        options: CodeModeRunOptions,
         response: oneshot::Sender<Result<ExecutionState, String>>,
     },
     Artifact {
@@ -74,6 +108,7 @@ enum ServiceRequest {
     },
     Approve {
         execution_id: String,
+        detached: bool,
         seq: u64,
         options: CodeModeRunOptions,
         response: oneshot::Sender<Result<ExecutionState, String>>,
@@ -157,6 +192,74 @@ impl LocalCodeModeService {
 
 #[async_trait::async_trait]
 impl CodeModeService for LocalCodeModeService {
+    async fn recover(
+        &self,
+        execution_id: String,
+        options: CodeModeRunOptions,
+    ) -> Result<ExecutionState, String> {
+        let (response, receiver) = oneshot::channel();
+        self.send(ServiceRequest::Resume {
+            execution_id,
+            recover: true,
+            options,
+            response,
+        })
+        .await?;
+        receive(receiver).await
+    }
+    async fn approve_detached(
+        &self,
+        execution_id: String,
+        seq: u64,
+        options: CodeModeRunOptions,
+    ) -> Result<ExecutionState, String> {
+        let (response, receiver) = oneshot::channel();
+        self.send(ServiceRequest::Approve {
+            execution_id,
+            detached: true,
+            seq,
+            options,
+            response,
+        })
+        .await?;
+        receive(receiver).await
+    }
+    fn supports_retained_execution(&self) -> bool {
+        true
+    }
+
+    async fn execute_retained(
+        &self,
+        code: String,
+        retention_ms: u64,
+        options: CodeModeRunOptions,
+    ) -> Result<ExecutionState, String> {
+        let (response, receiver) = oneshot::channel();
+        self.send(ServiceRequest::Execute {
+            code,
+            retention_ms: Some(retention_ms),
+            options,
+            response,
+        })
+        .await?;
+        receive(receiver).await
+    }
+
+    async fn resume(
+        &self,
+        execution_id: String,
+        options: CodeModeRunOptions,
+    ) -> Result<ExecutionState, String> {
+        let (response, receiver) = oneshot::channel();
+        self.send(ServiceRequest::Resume {
+            execution_id,
+            recover: false,
+            options,
+            response,
+        })
+        .await?;
+        receive(receiver).await
+    }
     async fn search(&self, query: String) -> Result<SearchOutput, String> {
         let (response, receiver) = oneshot::channel();
         self.send(ServiceRequest::Search { query, response })
@@ -172,6 +275,7 @@ impl CodeModeService for LocalCodeModeService {
         let (response, receiver) = oneshot::channel();
         self.send(ServiceRequest::Execute {
             code,
+            retention_ms: None,
             options,
             response,
         })
@@ -209,6 +313,7 @@ impl CodeModeService for LocalCodeModeService {
         let (response, receiver) = oneshot::channel();
         self.send(ServiceRequest::Approve {
             execution_id,
+            detached: false,
             seq,
             options,
             response,
@@ -250,14 +355,48 @@ async fn serve_requests(codemode: Rc<CodeMode>, mut receiver: mpsc::Receiver<Ser
         let codemode = Rc::clone(&codemode);
         tokio::task::spawn_local(async move {
             match request {
+                ServiceRequest::Resume {
+                    execution_id,
+                    recover,
+                    options,
+                    response,
+                } => match codemode.execution_snapshot(&execution_id).await {
+                    Ok(state) if state.status == incurs_codemode::ExecutionStatus::Running => {
+                        let _ = response.send(Ok(state));
+                        if recover {
+                            let _ = codemode.drive_if_idle(&execution_id, options).await;
+                        } else {
+                            let _ = codemode.drive_with(&execution_id, options).await;
+                        }
+                    }
+                    Ok(state) if recover => {
+                        let _ = response.send(Ok(state));
+                    }
+                    Ok(_) => {
+                        let _ = response.send(Err("Only an interrupted running execution can resume; pending approvals require a decision".into()));
+                    }
+                    Err(error) => {
+                        let _ = response.send(Err(error));
+                    }
+                },
                 ServiceRequest::Search { query, response } => {
                     let _ = response.send(codemode.search(&query).await);
                 }
                 ServiceRequest::Execute {
                     code,
+                    retention_ms,
                     options,
                     response,
-                } => match codemode.start(&code).await {
+                } => match async {
+                    let id = if retention_ms.is_some() {
+                        Some(random_execution_id()?)
+                    } else {
+                        None
+                    };
+                    codemode.start_retained(&code, retention_ms, id).await
+                }
+                .await
+                {
                     Ok(state) => {
                         let execution_id = state.id.clone();
                         let _ = response.send(Ok(state));
@@ -282,10 +421,26 @@ async fn serve_requests(codemode: Rc<CodeMode>, mut receiver: mpsc::Receiver<Ser
                 }
                 ServiceRequest::Approve {
                     execution_id,
+                    detached,
                     seq,
                     options,
                     response,
                 } => {
+                    if detached {
+                        match codemode.approve_pending(&execution_id, seq).await {
+                            Ok(winner) => {
+                                let _ =
+                                    response.send(codemode.execution_snapshot(&execution_id).await);
+                                if winner {
+                                    let _ = codemode.drive_with(&execution_id, options).await;
+                                }
+                            }
+                            Err(error) => {
+                                let _ = response.send(Err(error));
+                            }
+                        }
+                        return;
+                    }
                     let result = match codemode.approve_with(&execution_id, seq, options).await {
                         Ok(_) => codemode.execution_snapshot(&execution_id).await,
                         Err(error) => Err(error),
@@ -318,172 +473,11 @@ async fn serve_requests(codemode: Rc<CodeMode>, mut receiver: mpsc::Receiver<Ser
     }
 }
 
-#[async_trait::async_trait(?Send)]
-impl CodeExecutor for LocalExecutor {
-    async fn execute(
-        &self,
-        code: &str,
-        connectors: &[ConnectorDescription],
-        execution_id: &str,
-        host: Arc<ExecutionHost>,
-    ) -> Result<ExecuteResult, String> {
-        let runtime = AsyncRuntime::new().map_err(js_error)?;
-        runtime.set_memory_limit(self.options.memory_limit).await;
-        runtime.set_max_stack_size(self.options.stack_size).await;
-        let timeout = self.options.timeout;
-        let deadline = Arc::new(Mutex::new(Instant::now() + timeout));
-        let timed_out = Arc::new(AtomicBool::new(false));
-        let interrupt_deadline = Arc::clone(&deadline);
-        let interrupt_timed_out = Arc::clone(&timed_out);
-        runtime
-            .set_interrupt_handler(Some(Box::new(move || {
-                if Instant::now() < *interrupt_deadline.lock().unwrap() {
-                    return false;
-                }
-                interrupt_timed_out.store(true, Ordering::SeqCst);
-                true
-            })))
-            .await;
-        let context = AsyncContext::full(&runtime).await.map_err(js_error)?;
-        let program = build_program_source(
-            code,
-            connectors,
-            &ProgramSourceOptions {
-                dispatch:
-                    "async (payload) => JSON.parse(await __incursDispatch(JSON.stringify(payload)))"
-                        .to_string(),
-                execution_id: serde_json::to_string(execution_id)
-                    .map_err(|error| error.to_string())?,
-                timeout_ms: None,
-            },
-        )?;
-        let source =
-            format!("(async () => JSON.stringify(await (async () => {{\n{program}\n}})()))()");
-        context
-            .async_with(async move |context| {
-                let dispatch_host = Arc::clone(&host);
-                let dispatch_deadline = Arc::clone(&deadline);
-                let dispatch = Function::new(
-                    context.clone(),
-                    Async(move |payload: String| {
-                        let host = Arc::clone(&dispatch_host);
-                        let deadline = Arc::clone(&dispatch_deadline);
-                        async move {
-                            renew_deadline(&deadline, timeout);
-                            let response = dispatch(&host, &payload).await;
-                            renew_deadline(&deadline, timeout);
-                            response
-                        }
-                    }),
-                )
-                .map_err(js_error)?;
-                context
-                    .globals()
-                    .set("__incursDispatch", dispatch)
-                    .map_err(js_error)?;
-                let promise = context
-                    .eval::<Promise<'_>, _>(source)
-                    .map_err(|error| js_execution_error(&context, error, &timed_out))?;
-                let output = promise
-                    .into_future::<String>()
-                    .await
-                    .map_err(|error| js_execution_error(&context, error, &timed_out))?;
-                serde_json::from_str(&output).map_err(|error| error.to_string())
-            })
-            .await
-    }
-}
-
-fn renew_deadline(deadline: &Mutex<Instant>, timeout: Duration) {
-    *deadline.lock().unwrap() = Instant::now() + timeout;
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum LocalDispatchRequest {
-    Call {
-        seq: u64,
-        connector: String,
-        method: String,
-        arguments: Value,
-    },
-    BeginStep {
-        seq: u64,
-        name: String,
-    },
-    RecordStep {
-        seq: u64,
-        result: Value,
-    },
-}
-
-async fn dispatch(host: &ExecutionHost, payload: &str) -> String {
-    let result = match serde_json::from_str::<LocalDispatchRequest>(payload) {
-        Ok(LocalDispatchRequest::Call {
-            seq,
-            connector,
-            method,
-            arguments,
-        }) => serde_json::to_value(host.call(seq, &connector, &method, arguments).await)
-            .map_err(|error| error.to_string()),
-        Ok(LocalDispatchRequest::BeginStep { seq, name }) => host
-            .begin_step(seq, &name)
-            .await
-            .and_then(|response| serde_json::to_value(response).map_err(|error| error.to_string())),
-        Ok(LocalDispatchRequest::RecordStep { seq, result }) => host
-            .record_step(seq, result)
-            .await
-            .map(|()| serde_json::json!({ "ok": true })),
-        Err(error) => Err(error.to_string()),
-    };
-    serde_json::to_string(&result.unwrap_or_else(|message| {
-        serde_json::json!({
-            "__codemode_control__": "error",
-            "message": message,
-        })
-    }))
-    .unwrap_or_else(|error| {
-        format!(
-            "{{\"__codemode_control__\":\"error\",\"message\":{}}}",
-            serde_json::to_string(&error.to_string()).unwrap()
-        )
-    })
-}
-
-fn js_error(error: rquickjs::Error) -> String {
-    error.to_string()
-}
-
-fn js_execution_error(
-    context: &rquickjs::Ctx<'_>,
-    error: rquickjs::Error,
-    timed_out: &AtomicBool,
-) -> String {
-    if timed_out.load(Ordering::SeqCst) {
-        CODE_EXECUTION_TIMEOUT.to_string()
-    } else {
-        match rquickjs::CaughtError::from_error(context, error) {
-            rquickjs::CaughtError::Exception(exception) => {
-                let name = exception
-                    .as_object()
-                    .get::<_, String>("name")
-                    .unwrap_or_else(|_| "Error".to_string());
-                let message = exception.message().unwrap_or_default();
-                let mut diagnostic = format!("{name}: {message}");
-                if let Some(stack) = exception.stack() {
-                    diagnostic.push('\n');
-                    diagnostic.push_str(&stack);
-                }
-                diagnostic
-            }
-            error => error.to_string(),
-        }
-    }
-}
-
-#[cfg(test)]
+#[cfg(all(test, feature = "quickjs"))]
 mod tests {
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use incurs::cli::Cli;
     use incurs::command::{
@@ -770,6 +764,24 @@ mod tests {
 
     struct WaitingConnector;
 
+    #[tokio::test]
+    async fn concurrent_executions_keep_distinct_native_heaps() {
+        let mode = CodeMode::new(
+            Arc::new(MemoryStore::default()),
+            LocalExecutor::default(),
+            vec![Arc::new(DelayConnector)],
+        );
+        let first = mode.execute(
+            "async () => { const token = 'first'; await delay.sleep({ms: 20}); return token; }",
+        );
+        let second = mode.execute(
+            "async () => { const token = 'second'; await delay.sleep({ms: 1}); return token; }",
+        );
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.unwrap().result, Some(json!("first")));
+        assert_eq!(second.unwrap().result, Some(json!("second")));
+    }
+
     #[async_trait::async_trait]
     impl Connector for WaitingConnector {
         fn name(&self) -> &str {
@@ -910,137 +922,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn circular_values_fail_without_rejecting_shared_references() {
-        let codemode = CodeMode::new(
-            Arc::new(MemoryStore::default()),
-            LocalExecutor::default(),
-            vec![Arc::new(ContextConnector)],
-        );
-        for code in [
-            "const value = {}; value.self = value; return value;",
-            "const value = []; value.push(value); return value;",
-            "const value = {}; value.self = value; return await context.inspect(value);",
-            "return await codemode.step('cycle', async () => { const value = {}; value.self = value; return value; });",
-        ] {
-            let execution = codemode.execute(code).await.unwrap();
-            assert_eq!(execution.status, ExecutionStatus::Error, "{execution:?}");
-            let error = execution.error.as_deref().expect("recorded cycle error");
-            assert!(
-                error.contains("CODE_VALUE_CYCLE"),
-                "cycle must have a specific diagnostic: {error}"
-            );
-        }
-        let execution = codemode
-            .execute("const shared = {answer: 42}; return {left: shared, right: shared};")
-            .await
-            .unwrap();
-        assert_eq!(execution.status, ExecutionStatus::Completed);
-        assert_eq!(
-            execution.result,
-            Some(json!({"left": {"answer": 42}, "right": {"answer": 42}}))
-        );
-    }
-
-    #[tokio::test]
-    async fn caught_cycles_preserve_recovery_and_unrecorded_step_outcomes() {
-        let codemode = CodeMode::new(
-            Arc::new(MemoryStore::default()),
-            LocalExecutor::default(),
-            vec![Arc::new(MathConnector::default())],
-        );
-        let execution = codemode
-            .execute(
-                "const value = {}; value.self = value; const errors = []; \
-                 try { await math.sum(value); } catch (error) { errors.push(String(error)); } \
-                 try { await codemode.step('unrecorded', async () => value); } \
-                 catch (error) { errors.push(String(error)); } \
-                 const answer = await codemode.step('valid', async () => \
-                   (await math.sum({left: 20, right: 22})).sum); \
-                 return {errors, answer};",
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            execution.status,
-            ExecutionStatus::Completed,
-            "{execution:?}"
-        );
-        let result = execution.result.as_ref().unwrap();
-        assert_eq!(result["answer"], json!(42));
-        let errors = result["errors"].as_array().unwrap();
-        assert_eq!(errors.len(), 2);
-        assert!(errors.iter().all(|error| {
-            error
-                .as_str()
-                .is_some_and(|message| message.contains("CODE_VALUE_CYCLE"))
-        }));
-        assert_eq!(execution.log.len(), 3);
-        let unrecorded = &execution.log[0];
-        assert_eq!(unrecorded.seq, 1);
-        assert_eq!(unrecorded.connector, "__step");
-        assert_eq!(unrecorded.state, incurs_codemode::LogEntryState::Executing);
-        assert!(unrecorded.result.is_none());
-        let recorded = &execution.log[1];
-        assert_eq!(recorded.seq, 2);
-        assert_eq!(recorded.state, incurs_codemode::LogEntryState::Applied);
-        assert_eq!(recorded.result, Some(json!(42)));
-        let error = codemode.rollback(&execution.id).await.unwrap_err();
-        assert!(error.contains("unfinished"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn javascript_errors_preserve_exception_details() {
-        let codemode = CodeMode::new(
-            Arc::new(MemoryStore::default()),
-            LocalExecutor::default(),
-            Vec::new(),
-        );
-        for (code, expected) in [
-            (
-                "const value = \"first\nsecond\"; return value;",
-                "SyntaxError",
-            ),
-            (
-                "throw new TypeError('diagnostic-sentinel');",
-                "diagnostic-sentinel",
-            ),
-            (
-                "await Promise.reject(new Error('rejection-sentinel'));",
-                "rejection-sentinel",
-            ),
-        ] {
-            let execution = codemode.execute(code).await.unwrap();
-            assert_eq!(execution.status, ExecutionStatus::Error);
-            let error = execution.error.as_deref().expect("recorded exception");
-            assert!(error.contains(expected), "{expected}: {error}");
-            if expected == "SyntaxError" {
-                assert!(
-                    error.contains("eval_script"),
-                    "missing source location: {error}"
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn javascript_primitive_exceptions_preserve_the_thrown_value() {
-        let codemode = CodeMode::new(
-            Arc::new(MemoryStore::default()),
-            LocalExecutor::default(),
-            Vec::new(),
-        );
-        let execution = codemode.execute("throw 42;").await.unwrap();
-        assert_eq!(execution.status, ExecutionStatus::Error);
-        assert!(
-            execution
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("42")),
-            "{execution:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn interrupts_runaway_local_programs() {
         let codemode = CodeMode::new(
             Arc::new(MemoryStore::default()),
@@ -1107,6 +988,7 @@ mod tests {
                 "context.inspect({})",
                 CodeModeRunOptions {
                     request: Some(incurs::command::RequestContext {
+                        elicitation: None,
                         headers: Default::default(),
                         method: "POST".to_string(),
                         path: "/codemode".to_string(),
@@ -1137,57 +1019,6 @@ mod tests {
             event,
             ExecutionEvent::Chunk { data, .. } if data == &json!({"part": 1})
         )));
-    }
-
-    #[tokio::test]
-    async fn actor_stack_headroom_preserves_service_after_javascript_overflow() {
-        let service = LocalCodeModeService::spawn_with_stack_size(8 * 1024 * 1024, || {
-            CodeMode::new(
-                Arc::new(MemoryStore::default()),
-                LocalExecutor::new(LocalExecutorOptions {
-                    stack_size: 2 * 1024 * 1024,
-                    ..LocalExecutorOptions::default()
-                }),
-                vec![],
-            )
-        })
-        .unwrap();
-        for (code, expected_status, expected_error) in [
-            (
-                "function recurse() { return recurse() + 1; } return recurse();",
-                ExecutionStatus::Error,
-                Some("Maximum call stack size exceeded"),
-            ),
-            ("return 42;", ExecutionStatus::Completed, None),
-        ] {
-            let running = service
-                .execute(code.to_string(), CodeModeRunOptions::default())
-                .await
-                .unwrap();
-            let execution = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let execution = service.execution(running.id.clone()).await.unwrap();
-                    if execution.status != ExecutionStatus::Running {
-                        break execution;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("actor must remain responsive");
-            assert_eq!(execution.status, expected_status, "{execution:?}");
-            if let Some(expected) = expected_error {
-                assert!(
-                    execution
-                        .error
-                        .as_deref()
-                        .is_some_and(|error| error.contains(expected)),
-                    "{execution:?}"
-                );
-            } else {
-                assert_eq!(execution.result, Some(json!(42)));
-            }
-        }
     }
 
     #[tokio::test]
@@ -1321,5 +1152,186 @@ mod tests {
             1,
             "a used namespace is described exactly once per pass"
         );
+    }
+    #[tokio::test]
+    async fn circular_values_fail_without_rejecting_shared_references() {
+        let codemode = CodeMode::new(
+            Arc::new(MemoryStore::default()),
+            LocalExecutor::default(),
+            vec![Arc::new(ContextConnector)],
+        );
+        for code in [
+            "const value = {}; value.self = value; return value;",
+            "const value = []; value.push(value); return value;",
+            "const value = {}; value.self = value; return await context.inspect(value);",
+            "return await codemode.step('cycle', async () => { const value = {}; value.self = value; return value; });",
+        ] {
+            let execution = codemode.execute(code).await.unwrap();
+            assert_eq!(execution.status, ExecutionStatus::Error, "{execution:?}");
+            let error = execution.error.as_deref().expect("recorded cycle error");
+            assert!(
+                error.contains("CODE_VALUE_CYCLE"),
+                "cycle must have a specific diagnostic: {error}"
+            );
+        }
+        let execution = codemode
+            .execute("const shared = {answer: 42}; return {left: shared, right: shared};")
+            .await
+            .unwrap();
+        assert_eq!(execution.status, ExecutionStatus::Completed);
+        assert_eq!(
+            execution.result,
+            Some(json!({"left": {"answer": 42}, "right": {"answer": 42}}))
+        );
+    }
+
+    #[tokio::test]
+    async fn caught_cycles_preserve_recovery_and_unrecorded_step_outcomes() {
+        let codemode = CodeMode::new(
+            Arc::new(MemoryStore::default()),
+            LocalExecutor::default(),
+            vec![Arc::new(MathConnector::default())],
+        );
+        let execution = codemode
+            .execute(
+                "const value = {}; value.self = value; const errors = []; \
+                 try { await math.sum(value); } catch (error) { errors.push(String(error)); } \
+                 try { await codemode.step('unrecorded', async () => value); } \
+                 catch (error) { errors.push(String(error)); } \
+                 const answer = await codemode.step('valid', async () => \
+                   (await math.sum({left: 20, right: 22})).sum); \
+                 return {errors, answer};",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            execution.status,
+            ExecutionStatus::Completed,
+            "{execution:?}"
+        );
+        let result = execution.result.as_ref().unwrap();
+        assert_eq!(result["answer"], json!(42));
+        let errors = result["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 2);
+        assert!(errors.iter().all(|error| {
+            error
+                .as_str()
+                .is_some_and(|message| message.contains("CODE_VALUE_CYCLE"))
+        }));
+        assert_eq!(execution.log.len(), 3);
+        let unrecorded = &execution.log[0];
+        assert_eq!(unrecorded.seq, 1);
+        assert_eq!(unrecorded.connector, "__step");
+        assert_eq!(unrecorded.state, incurs_codemode::LogEntryState::Executing);
+        assert!(unrecorded.result.is_none());
+        let recorded = &execution.log[1];
+        assert_eq!(recorded.seq, 2);
+        assert_eq!(recorded.state, incurs_codemode::LogEntryState::Applied);
+        assert_eq!(recorded.result, Some(json!(42)));
+        let error = codemode.rollback(&execution.id).await.unwrap_err();
+        assert!(error.contains("unfinished"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn javascript_errors_preserve_exception_details() {
+        let codemode = CodeMode::new(
+            Arc::new(MemoryStore::default()),
+            LocalExecutor::default(),
+            Vec::new(),
+        );
+        for (code, expected) in [
+            (
+                "const value = \"first\nsecond\"; return value;",
+                "SyntaxError",
+            ),
+            (
+                "throw new TypeError('diagnostic-sentinel');",
+                "diagnostic-sentinel",
+            ),
+            (
+                "await Promise.reject(new Error('rejection-sentinel'));",
+                "rejection-sentinel",
+            ),
+        ] {
+            let execution = codemode.execute(code).await.unwrap();
+            assert_eq!(execution.status, ExecutionStatus::Error);
+            let error = execution.error.as_deref().expect("recorded exception");
+            assert!(error.contains(expected), "{expected}: {error}");
+            if expected == "SyntaxError" {
+                assert!(
+                    error.contains("codemode.js"),
+                    "missing source location: {error}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn javascript_primitive_exceptions_preserve_the_thrown_value() {
+        let codemode = CodeMode::new(
+            Arc::new(MemoryStore::default()),
+            LocalExecutor::default(),
+            Vec::new(),
+        );
+        let execution = codemode.execute("throw 42;").await.unwrap();
+        assert_eq!(execution.status, ExecutionStatus::Error);
+        assert!(
+            execution
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("42")),
+            "{execution:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn actor_stack_headroom_preserves_service_after_javascript_overflow() {
+        let service = LocalCodeModeService::spawn_with_stack_size(8 * 1024 * 1024, || {
+            CodeMode::new(
+                Arc::new(MemoryStore::default()),
+                LocalExecutor::new(LocalExecutorOptions {
+                    stack_size: 2 * 1024 * 1024,
+                    ..LocalExecutorOptions::default()
+                }),
+                vec![],
+            )
+        })
+        .unwrap();
+        for (code, expected_status, expected_error) in [
+            (
+                "function recurse() { return recurse() + 1; } return recurse();",
+                ExecutionStatus::Error,
+                Some("stack overflow"),
+            ),
+            ("return 42;", ExecutionStatus::Completed, None),
+        ] {
+            let running = service
+                .execute(code.to_string(), CodeModeRunOptions::default())
+                .await
+                .unwrap();
+            let execution = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let execution = service.execution(running.id.clone()).await.unwrap();
+                    if execution.status != ExecutionStatus::Running {
+                        break execution;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("actor must remain responsive");
+            assert_eq!(execution.status, expected_status, "{execution:?}");
+            if let Some(expected) = expected_error {
+                assert!(
+                    execution
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains(expected)),
+                    "{execution:?}"
+                );
+            } else {
+                assert_eq!(execution.result, Some(json!(42)));
+            }
+        }
     }
 }

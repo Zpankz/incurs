@@ -5969,7 +5969,7 @@ mod tests {
             fs::read_to_string(root.join("skills/project/SKILL.md"))
                 .unwrap()
                 .contains(
-                    "description: \"Project workflows. List projects. Run `demo-tools project --help` for usage details.\""
+                    "description: \"Project workflows. Run `demo-tools project --help` for usage details.\""
                 )
         );
 

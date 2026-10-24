@@ -139,6 +139,7 @@ impl RemoteRequestMetadata {
     /// Converts this remote metadata into the Incurs command request context.
     pub fn to_request_context(&self) -> RequestContext {
         RequestContext {
+            elicitation: None,
             headers: self.headers.clone(),
             method: self.method.clone(),
             path: self.path.clone(),

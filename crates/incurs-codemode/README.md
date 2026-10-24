@@ -13,14 +13,14 @@ platform-specific adapters in a standalone extension workspace.
 use std::sync::Arc;
 
 use incurs::cli::Cli;
-use incurs_codemode::{CodeMode, IncurConnector, MemoryStore};
-use incurs_codemode_local::LocalExecutor;
+use incurs_codemode::IncurConnector;
+use incurs_codemode_local::open_codemode;
 
-let codemode = CodeMode::new(
-    Arc::new(MemoryStore::default()),
-    LocalExecutor::default(),
+let codemode = open_codemode(
+    "codemode.sqlite",
+    Default::default(),
     vec![Arc::new(IncurConnector::new(cli.tool_catalog()))],
-);
+)?;
 let execution = codemode.execute("tools.lookup({ id: 42 })").await?;
 ```
 

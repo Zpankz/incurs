@@ -5,6 +5,7 @@
 //! execution and durable persistence are supplied through traits so the same
 //! runtime can run through local or remote executors.
 
+mod checkpoint;
 mod codec;
 mod codemode;
 mod connector;
@@ -17,6 +18,7 @@ mod search;
 mod service;
 mod typescript;
 
+pub use checkpoint::ExecutionCheckpoint;
 pub use codec::{CodeValue, decode_value, encode_value};
 pub use codemode::{CodeMode, CodeModeRunOptions};
 pub use connector::{
@@ -28,7 +30,7 @@ pub use connector::{
 pub use dispatch::{DispatchResponse, DispatchSession, StepResponse};
 pub use engine::{Clock, CodeExecutor, DispatchRequest, ExecuteResult, ExecutionHost, SystemClock};
 pub use normalize::normalize_code;
-pub use program::{ProgramSourceOptions, build_program_source};
+pub use program::{ProgramSourceOptions, build_checkpoint_source, build_program_source};
 pub use runtime::{
     ArtifactRef, ArtifactStore, CapabilitySnapshot, CodeModeRuntime, DEFAULT_MAX_EVENTS,
     DEFAULT_MAX_EXECUTIONS, DEFAULT_PAUSED_TTL_MS, ExecutionEvent, ExecutionState, ExecutionStatus,
